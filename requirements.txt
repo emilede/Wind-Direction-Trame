@@ -3,4 +3,4 @@ trame-vuetify>=2.0.0
 trame-deckgl>=0.1.0
 pydeck>=0.8.0
 numpy>=1.21.0
-requests
+requeststrame-plotly
