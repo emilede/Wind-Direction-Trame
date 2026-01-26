@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        body { margin: 0; padding: 0; }
+        #map { position: absolute; top: 0; bottom: 0; width: 100%; }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <script>
+        const map = L.map('map', {
+            center: [20, 0],
+            zoom: 2,
+            minZoom: 0,
+            maxZoom: 4
+        });
+        
+        // Dark basemap
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+            attribution: '&copy; OpenStreetMap, &copy; CARTO',
+            subdomains: 'abcd'
+        }).addTo(map);
+        
+        // Wind overlay
+        const windLayer = L.tileLayer('/tiles/{z}/{x}/{y}.png', {
+            opacity: 0.7,
+            maxZoom: 4
+        }).addTo(map);
+        
+        // Listen for opacity changes from parent
+        window.addEventListener('message', (e) => {
+            if (e.data.opacity !== undefined) {
+                windLayer.setOpacity(e.data.opacity / 100);
+            }
+        });
+    </script>
+</body>
+</html>
