@@ -36,16 +36,27 @@ with SinglePageLayout(server) as layout:
             with leaflet.LMap(
                 zoom=("zoom", 2),
                 center=("center", [20, 0]),
+                world_copy_jump=True,
+                max_zoom=5,
+                min_zoom=3,
+                zoom_snap=0,
+                zoom_delta=0.25,
+                wheel_px_per_zoom_level=200,
                 style="height: 100%; width: 100%;",
             ):
                 # Dark basemap
                 leaflet.LTileLayer(
-                    url=("base_url", "https://cartodb-basemaps-{s}.global.ssl.fastly.net/dark_all/{z}/{x}/{y}.png"),
+                    url="https://tiles.stadiamaps.com/tiles/alidade_smooth_dark/{z}/{x}/{y}.png",
+                    minZoom=2,
+                    maxZoom=5,
                 )
+
                 # Wind tiles
                 leaflet.LTileLayer(
                     url=("wind_url", "/tiles/{z}/{x}/{y}.png"),
-                    opacity=0.6,
+                    opacity=0.3,
+                    minZoom=2,
+                    maxZoom=5,
                 )
 
 if __name__ == "__main__":

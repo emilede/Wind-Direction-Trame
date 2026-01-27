@@ -1,233 +1,200 @@
 #!/usr/bin/env python3
 """
-Generate wind speed tiles using VTK.
-
-Output: tiles/{z}/{x}/{y}.png (standard XYZ structure)
-These tiles are transparent PNGs meant to overlay on a web basemap.
+Generate tile pyramid for wind visualization.
+Uses padding/overlap to eliminate harsh edges between tiles.
 """
 
 import json
+import sys
+import os
 import numpy as np
-from pathlib import Path
-import vtk  # type: ignore
-from vtk.util.numpy_support import vtk_to_numpy  # type: ignore
-from PIL import Image  # type: ignore
-import argparse
+from scipy.interpolate import griddata
+from scipy.ndimage import gaussian_filter
+from PIL import Image
 
+# ============ CONFIG ============
+TILE_SIZE = 512     # Higher resolution tiles
+MIN_ZOOM = 2
+MAX_ZOOM = 5
+BLUR_SCALE = 5      # Slightly more blur for smoothness
+PADDING = 64        # More padding for larger tiles
+OUTPUT_DIR = 'data/tiles'
+# ================================
 
-class WindTileGenerator:
-    """Generate map tiles from wind data using VTK for smooth interpolation."""
-    
-    TILE_SIZE = 256
-    SPEED_MIN = 0
-    SPEED_MAX = 30
-    
-    def __init__(self, wind_data_path: str):
-        self.load_data(wind_data_path)
-        self.build_mesh()
-    
-    def load_data(self, path: str):
-        """Load wind data from JSON."""
-        print(f"Loading {path}...")
-        with open(path) as f:
-            data = json.load(f)
-        
-        self.lats = np.array([p['lat'] for p in data])
-        self.lons = np.array([p['lon'] for p in data])
-        self.speeds = np.array([p['speed'] for p in data])
-        
-        print(f"  {len(self.lats)} points")
-        print(f"  Speed range: {self.speeds.min():.1f} - {self.speeds.max():.1f} m/s")
-    
-    def build_mesh(self):
-        """Create triangulated mesh from wind points."""
-        print("Building mesh...")
-        n = len(self.lats)
-        
-        # Points
-        points = vtk.vtkPoints()
-        points.SetNumberOfPoints(n)
-        for i in range(n):
-            points.SetPoint(i, self.lons[i], self.lats[i], 0.0)
-        
-        # Scalars
-        speed_arr = vtk.vtkFloatArray()
-        speed_arr.SetName("speed")
-        speed_arr.SetNumberOfTuples(n)
-        for i, s in enumerate(self.speeds):
-            speed_arr.SetValue(i, s)
-        
-        # PolyData
-        polydata = vtk.vtkPolyData()
-        polydata.SetPoints(points)
-        polydata.GetPointData().SetScalars(speed_arr)
-        
-        # Triangulate
-        delaunay = vtk.vtkDelaunay2D()
-        delaunay.SetInputData(polydata)
-        delaunay.SetTolerance(0.0001)
-        delaunay.Update()
-        
-        self.mesh = delaunay.GetOutput()
-        print(f"  {self.mesh.GetNumberOfCells()} triangles")
-    
-    def create_lut(self):
-        """Create Turbo colormap lookup table."""
-        lut = vtk.vtkLookupTable()
-        lut.SetNumberOfTableValues(256)
-        
-        # Turbo colormap
-        turbo = [
-            (0.190, 0.072, 0.231), (0.232, 0.130, 0.393), (0.266, 0.210, 0.563),
-            (0.282, 0.317, 0.715), (0.278, 0.433, 0.836), (0.254, 0.560, 0.912),
-            (0.212, 0.684, 0.937), (0.165, 0.793, 0.915), (0.143, 0.877, 0.850),
-            (0.194, 0.929, 0.746), (0.326, 0.951, 0.615), (0.501, 0.944, 0.469),
-            (0.679, 0.913, 0.329), (0.833, 0.859, 0.210), (0.950, 0.782, 0.133),
-            (1.000, 0.682, 0.109), (0.977, 0.561, 0.115), (0.906, 0.431, 0.122),
-            (0.808, 0.301, 0.111), (0.692, 0.184, 0.083), (0.566, 0.089, 0.046),
-            (0.429, 0.025, 0.013), (0.357, 0.007, 0.004),
-        ]
-        
-        for i in range(256):
-            t = i / 255.0
-            idx = min(int(t * (len(turbo) - 1)), len(turbo) - 2)
-            frac = t * (len(turbo) - 1) - idx
-            
-            r = turbo[idx][0] + frac * (turbo[idx + 1][0] - turbo[idx][0])
-            g = turbo[idx][1] + frac * (turbo[idx + 1][1] - turbo[idx][1])
-            b = turbo[idx][2] + frac * (turbo[idx + 1][2] - turbo[idx][2])
-            
-            lut.SetTableValue(i, r, g, b, 1.0)
-        
-        lut.SetRange(self.SPEED_MIN, self.SPEED_MAX)
-        lut.Build()
-        return lut
-    
-    def render_tile(self, zoom: int, tx: int, ty: int) -> np.ndarray:
-        """Render a single tile. Returns RGBA numpy array."""
-        # Calculate tile bounds (Web Mercator / equirectangular approximation)
-        num_tiles = 2 ** zoom
-        
-        tile_lon_size = 360.0 / num_tiles
-        tile_lat_size = 180.0 / num_tiles
-        
-        lon_min = -180 + tx * tile_lon_size
-        lon_max = lon_min + tile_lon_size
-        lat_max = 90 - ty * tile_lat_size  # Y increases downward in tile coords
-        lat_min = lat_max - tile_lat_size
-        
-        # Mapper with smooth interpolation
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputData(self.mesh)
-        mapper.SetScalarRange(self.SPEED_MIN, self.SPEED_MAX)
-        mapper.SetLookupTable(self.create_lut())
-        mapper.SetInterpolateScalarsBeforeMapping(True)
-        
-        # Actor
-        actor = vtk.vtkActor()
-        actor.SetMapper(mapper)
-        actor.GetProperty().SetInterpolationToGouraud()
-        actor.GetProperty().LightingOff()
-        
-        # Renderer with transparent background
-        renderer = vtk.vtkRenderer()
-        renderer.AddActor(actor)
-        renderer.SetBackground(0, 0, 0)
-        
-        # Orthographic camera for this tile's bounds
-        camera = renderer.GetActiveCamera()
-        camera.ParallelProjectionOn()
-        
-        center_lon = (lon_min + lon_max) / 2
-        center_lat = (lat_min + lat_max) / 2
-        
-        camera.SetPosition(center_lon, center_lat, 1)
-        camera.SetFocalPoint(center_lon, center_lat, 0)
-        camera.SetViewUp(0, 1, 0)
-        camera.SetParallelScale((lat_max - lat_min) / 2)
-        
-        # Render window (offscreen)
-        render_window = vtk.vtkRenderWindow()
-        render_window.SetOffScreenRendering(1)
-        render_window.AddRenderer(renderer)
-        render_window.SetSize(self.TILE_SIZE, self.TILE_SIZE)
-        render_window.SetAlphaBitPlanes(1)
-        render_window.Render()
-        
-        # Capture to image
-        w2i = vtk.vtkWindowToImageFilter()
-        w2i.SetInput(render_window)
-        w2i.SetInputBufferTypeToRGBA()
-        w2i.Update()
-        
-        # Convert to numpy
-        vtk_image = w2i.GetOutput()
-        dims = vtk_image.GetDimensions()
-        
-        vtk_array = vtk_image.GetPointData().GetScalars()
-        rgba = vtk_to_numpy(vtk_array).reshape(dims[1], dims[0], 4)
-        
-        # Flip vertically (VTK origin is bottom-left)
-        rgba = np.flipud(rgba)
-        
-        # Set black pixels to transparent (where there's no data)
-        black_mask = (rgba[:, :, 0] == 0) & (rgba[:, :, 1] == 0) & (rgba[:, :, 2] == 0)
-        rgba[black_mask, 3] = 0
-        
-        render_window.Finalize()
-        
-        return rgba
-    
-    def generate_zoom_level(self, zoom: int, output_dir: Path) -> int:
-        """Generate all tiles for a zoom level. Returns tile count."""
-        num_tiles_x = 2 ** zoom
-        num_tiles_y = 2 ** zoom
-        
-        zoom_dir = output_dir / str(zoom)
-        count = 0
-        
-        for tx in range(num_tiles_x):
-            x_dir = zoom_dir / str(tx)
-            x_dir.mkdir(parents=True, exist_ok=True)
-            
-            for ty in range(num_tiles_y):
-                rgba = self.render_tile(zoom, tx, ty)
-                img = Image.fromarray(rgba.astype(np.uint8), mode='RGBA')
-                img.save(x_dir / f"{ty}.png", optimize=True)
-                count += 1
-        
-        return count
-    
-    def generate_all(self, output_dir: Path, min_zoom: int = 0, max_zoom: int = 4):
-        """Generate tiles for all zoom levels."""
-        output_dir.mkdir(exist_ok=True)
-        
-        total = 0
-        for z in range(min_zoom, max_zoom + 1):
-            print(f"Zoom {z}...", end=" ", flush=True)
-            count = self.generate_zoom_level(z, output_dir)
-            print(f"{count} tiles")
-            total += count
-        
-        print(f"\n✓ Generated {total} tiles in {output_dir}/")
+def log(msg):
+    print(msg)
+    sys.stdout.flush()
 
+def create_colormap():
+    """Turbo colormap"""
+    turbo = [
+        (0.190, 0.072, 0.231), (0.217, 0.110, 0.352), (0.241, 0.150, 0.466),
+        (0.259, 0.195, 0.568), (0.270, 0.245, 0.660), (0.275, 0.300, 0.740),
+        (0.272, 0.360, 0.805), (0.262, 0.423, 0.856), (0.245, 0.489, 0.894),
+        (0.222, 0.556, 0.919), (0.195, 0.622, 0.932), (0.167, 0.685, 0.933),
+        (0.142, 0.743, 0.922), (0.127, 0.794, 0.899), (0.125, 0.838, 0.866),
+        (0.142, 0.873, 0.823), (0.177, 0.901, 0.771), (0.229, 0.922, 0.710),
+        (0.296, 0.937, 0.643), (0.375, 0.946, 0.571), (0.461, 0.949, 0.496),
+        (0.550, 0.946, 0.420), (0.638, 0.937, 0.346), (0.720, 0.922, 0.278),
+        (0.795, 0.901, 0.218), (0.860, 0.873, 0.170), (0.913, 0.838, 0.137),
+        (0.954, 0.795, 0.120), (0.980, 0.745, 0.118), (0.993, 0.689, 0.127),
+        (0.992, 0.627, 0.143), (0.978, 0.562, 0.162), (0.952, 0.495, 0.178),
+        (0.916, 0.428, 0.189), (0.870, 0.363, 0.192), (0.816, 0.301, 0.187),
+        (0.756, 0.244, 0.174), (0.691, 0.193, 0.155), (0.624, 0.149, 0.132),
+        (0.555, 0.111, 0.107), (0.486, 0.080, 0.082), (0.419, 0.056, 0.058),
+    ]
+    
+    lut = np.zeros((256, 3), dtype=np.uint8)
+    for i in range(256):
+        t = i / 255.0
+        idx = min(int(t * (len(turbo) - 1)), len(turbo) - 2)
+        frac = t * (len(turbo) - 1) - idx
+        
+        r = turbo[idx][0] + frac * (turbo[idx + 1][0] - turbo[idx][0])
+        g = turbo[idx][1] + frac * (turbo[idx + 1][1] - turbo[idx][1])
+        b = turbo[idx][2] + frac * (turbo[idx + 1][2] - turbo[idx][2])
+        
+        lut[i] = [int(r * 255), int(g * 255), int(b * 255)]
+    
+    return lut
+
+def get_tile_bounds(z, x, y):
+    """Get lat/lon bounds for a tile with padding."""
+    n_tiles = 2 ** z
+    
+    lon_per_tile = 360.0 / n_tiles
+    lat_per_tile = 180.0 / n_tiles
+    
+    # Padding in degrees
+    lon_pad = lon_per_tile * (PADDING / TILE_SIZE)
+    lat_pad = lat_per_tile * (PADDING / TILE_SIZE)
+    
+    # Base bounds
+    lon_min = -180 + x * lon_per_tile
+    lon_max = lon_min + lon_per_tile
+    lat_max = 90 - y * lat_per_tile
+    lat_min = lat_max - lat_per_tile
+    
+    # Padded bounds
+    lon_min_pad = lon_min - lon_pad
+    lon_max_pad = lon_max + lon_pad
+    lat_min_pad = lat_min - lat_pad
+    lat_max_pad = lat_max + lat_pad
+    
+    return lon_min_pad, lon_max_pad, lat_min_pad, lat_max_pad
+
+def render_tile(lons, lats, speeds, z, x, y, lut):
+    """Render a single tile with padding, blur, then crop."""
+    lon_min, lon_max, lat_min, lat_max = get_tile_bounds(z, x, y)
+    
+    pad_deg = (lon_max - lon_min) * 0.2  # Larger padding for antimeridian
+    
+    # Create copies of data that we can modify
+    all_lons = lons.copy()
+    all_lats = lats.copy()
+    all_speeds = speeds.copy()
+    
+    # Add wrapped copies of points near the antimeridian
+    # Points near +180 get copied to -180 side (shifted by -360)
+    east_mask = lons > 170
+    if east_mask.any():
+        all_lons = np.concatenate([all_lons, lons[east_mask] - 360])
+        all_lats = np.concatenate([all_lats, lats[east_mask]])
+        all_speeds = np.concatenate([all_speeds, speeds[east_mask]])
+    
+    # Points near -180 get copied to +180 side (shifted by +360)
+    west_mask = lons < -170
+    if west_mask.any():
+        all_lons = np.concatenate([all_lons, lons[west_mask] + 360])
+        all_lats = np.concatenate([all_lats, lats[west_mask]])
+        all_speeds = np.concatenate([all_speeds, speeds[west_mask]])
+    
+    # Now filter to tile region
+    mask = (
+        (all_lons >= lon_min - pad_deg) & (all_lons <= lon_max + pad_deg) &
+        (all_lats >= lat_min - pad_deg) & (all_lats <= lat_max + pad_deg)
+    )
+    
+    if mask.sum() < 4:
+        return None
+    
+    tile_lons = all_lons[mask]
+    tile_lats = all_lats[mask]
+    tile_speeds = all_speeds[mask]
+    
+    # Render at padded size
+    padded_size = TILE_SIZE + 2 * PADDING
+    grid_lon = np.linspace(lon_min, lon_max, padded_size)
+    grid_lat = np.linspace(lat_max, lat_min, padded_size)
+    lon_mesh, lat_mesh = np.meshgrid(grid_lon, grid_lat)
+    
+    # Interpolate
+    grid_speeds = griddata(
+        (tile_lons, tile_lats), tile_speeds,
+        (lon_mesh, lat_mesh),
+        method='linear',
+        fill_value=0
+    )
+    
+    # Blur at padded size
+    blur_sigma = BLUR_SCALE * (2 ** (MAX_ZOOM - z))
+    if blur_sigma > 0.5:
+        grid_speeds = gaussian_filter(grid_speeds, sigma=blur_sigma)
+    
+    # Apply colormap
+    normalized = np.clip(grid_speeds / 30.0, 0, 1)
+    indices = (normalized * 255).astype(np.uint8)
+    rgb = lut[indices]
+    
+    # Crop to final tile size (remove padding)
+    rgb = rgb[PADDING:PADDING+TILE_SIZE, PADDING:PADDING+TILE_SIZE]
+    
+    return Image.fromarray(rgb, mode='RGB')
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate wind speed tiles")
-    parser.add_argument("input", help="Path to wind_data.json")
-    parser.add_argument("-o", "--output", default="tiles", help="Output directory")
-    parser.add_argument("--min-zoom", type=int, default=0)
-    parser.add_argument("--max-zoom", type=int, default=4)
+    log("Loading wind data...")
+    with open('data/wind_data.json') as f:
+        wind_data = json.load(f)
     
-    args = parser.parse_args()
+    lons = np.array([p['lon'] for p in wind_data])
+    lats = np.array([p['lat'] for p in wind_data])
+    speeds = np.array([p['speed'] for p in wind_data])
+    log(f"Loaded {len(wind_data):,} points")
     
-    generator = WindTileGenerator(args.input)
-    generator.generate_all(
-        Path(args.output),
-        min_zoom=args.min_zoom,
-        max_zoom=args.max_zoom
-    )
+    lut = create_colormap()
+    
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    total_tiles = sum(4 ** z for z in range(MIN_ZOOM, MAX_ZOOM + 1))
+    tile_count = 0
+    
+    for z in range(MIN_ZOOM, MAX_ZOOM + 1):
+        n_tiles = 2 ** z
+        log(f"\nZoom {z}: {n_tiles}x{n_tiles} tiles")
+        
+        zoom_dir = os.path.join(OUTPUT_DIR, str(z))
+        os.makedirs(zoom_dir, exist_ok=True)
+        
+        for x in range(n_tiles):
+            x_dir = os.path.join(zoom_dir, str(x))
+            os.makedirs(x_dir, exist_ok=True)
+            
+            for y in range(n_tiles):
+                tile_count += 1
+                tile_path = os.path.join(x_dir, f"{y}.png")
+                
+                img = render_tile(lons, lats, speeds, z, x, y, lut)
+                
+                if img:
+                    img.save(tile_path, optimize=True)
+                else:
+                    empty = Image.new('RGB', (TILE_SIZE, TILE_SIZE), (30, 30, 40))
+                    empty.save(tile_path)
+                
+                if tile_count % 20 == 0:
+                    log(f"  Progress: {tile_count}/{total_tiles} tiles")
+    
+    log(f"\n✓ Done: {tile_count} tiles saved to {OUTPUT_DIR}/")
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
