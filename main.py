@@ -34,11 +34,11 @@ with SinglePageLayout(server) as layout:
     with layout.content:
         with v3.VContainer(fluid=True, classes="fill-height pa-0"):
             with leaflet.LMap(
-                zoom=("zoom", 2),
+                zoom=("zoom", 3),
                 center=("center", [20, 0]),
                 world_copy_jump=True,
                 max_zoom=5,
-                min_zoom=3,
+                min_zoom=2,
                 zoom_snap=0,
                 zoom_delta=0.25,
                 wheel_px_per_zoom_level=200,
@@ -46,15 +46,20 @@ with SinglePageLayout(server) as layout:
             ):
                 # Dark basemap
                 leaflet.LTileLayer(
-                    url="https://tiles.stadiamaps.com/tiles/alidade_smooth_dark/{z}/{x}/{y}.png",
+                    url="https://cartodb-basemaps-{s}.global.ssl.fastly.net/dark_nolabels/{z}/{x}/{y}.png",
                     minZoom=2,
                     maxZoom=5,
                 )
-
                 # Wind tiles
                 leaflet.LTileLayer(
                     url=("wind_url", "/tiles/{z}/{x}/{y}.png"),
-                    opacity=0.3,
+                    opacity=1.0,
+                    minZoom=2,
+                    maxZoom=5,
+                )
+                # Labels on top
+                leaflet.LTileLayer(
+                    url="https://cartodb-basemaps-{s}.global.ssl.fastly.net/dark_only_labels/{z}/{x}/{y}.png",
                     minZoom=2,
                     maxZoom=5,
                 )

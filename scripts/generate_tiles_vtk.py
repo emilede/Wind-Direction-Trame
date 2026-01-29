@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Generate tile pyramid for wind visualization.
-Uses padding/overlap to eliminate harsh edges between tiles.
+Dual-layer approach: glow + detail with alpha transparency.
+Uses mercantile for correct Web Mercator projection.
 """
 
 import json
@@ -11,22 +12,32 @@ import numpy as np
 from scipy.interpolate import griddata
 from scipy.ndimage import gaussian_filter
 from PIL import Image
+import mercantile
 
 # ============ CONFIG ============
-TILE_SIZE = 512     # Higher resolution tiles
+TILE_SIZE = 256
+RENDER_SCALE = 1    # No oversampling for testing
 MIN_ZOOM = 2
-MAX_ZOOM = 5
-BLUR_SCALE = 5      # Slightly more blur for smoothness
-PADDING = 64        # More padding for larger tiles
+MAX_ZOOM = 3        # Just 2-3 for testing
+PADDING = 32
 OUTPUT_DIR = 'data/tiles'
+
+# Dual layer settings
+GLOW_BLUR = 4
+DETAIL_BLUR = 1
+GLOW_OPACITY = 0.5
+DETAIL_OPACITY = 0.9
+
+# Nonlinear transform exponent
+SPEED_GAMMA = 0.7
 # ================================
 
 def log(msg):
     print(msg)
     sys.stdout.flush()
 
-def create_colormap():
-    """Turbo colormap"""
+def create_colormap_rgba():
+    """Turbo colormap with alpha based on speed."""
     turbo = [
         (0.190, 0.072, 0.231), (0.217, 0.110, 0.352), (0.241, 0.150, 0.466),
         (0.259, 0.195, 0.568), (0.270, 0.245, 0.660), (0.275, 0.300, 0.740),
@@ -44,7 +55,7 @@ def create_colormap():
         (0.555, 0.111, 0.107), (0.486, 0.080, 0.082), (0.419, 0.056, 0.058),
     ]
     
-    lut = np.zeros((256, 3), dtype=np.uint8)
+    lut = np.zeros((256, 4), dtype=np.uint8)
     for i in range(256):
         t = i / 255.0
         idx = min(int(t * (len(turbo) - 1)), len(turbo) - 2)
@@ -54,65 +65,53 @@ def create_colormap():
         g = turbo[idx][1] + frac * (turbo[idx + 1][1] - turbo[idx][1])
         b = turbo[idx][2] + frac * (turbo[idx + 1][2] - turbo[idx][2])
         
-        lut[i] = [int(r * 255), int(g * 255), int(b * 255)]
+        # Alpha ramps up with speed (low speed = more transparent)
+        alpha = min(1.0, t * 1.5)  # Boost alpha curve
+        
+        lut[i] = [int(r * 255), int(g * 255), int(b * 255), int(alpha * 255)]
     
     return lut
 
-def get_tile_bounds(z, x, y):
-    """Get lat/lon bounds for a tile with padding."""
-    n_tiles = 2 ** z
-    
-    lon_per_tile = 360.0 / n_tiles
-    lat_per_tile = 180.0 / n_tiles
-    
-    # Padding in degrees
-    lon_pad = lon_per_tile * (PADDING / TILE_SIZE)
-    lat_pad = lat_per_tile * (PADDING / TILE_SIZE)
-    
-    # Base bounds
-    lon_min = -180 + x * lon_per_tile
-    lon_max = lon_min + lon_per_tile
-    lat_max = 90 - y * lat_per_tile
-    lat_min = lat_max - lat_per_tile
-    
-    # Padded bounds
-    lon_min_pad = lon_min - lon_pad
-    lon_max_pad = lon_max + lon_pad
-    lat_min_pad = lat_min - lat_pad
-    lat_max_pad = lat_max + lat_pad
-    
-    return lon_min_pad, lon_max_pad, lat_min_pad, lat_max_pad
 
 def render_tile(lons, lats, speeds, z, x, y, lut):
-    """Render a single tile with padding, blur, then crop."""
-    lon_min, lon_max, lat_min, lat_max = get_tile_bounds(z, x, y)
+    """Render dual-layer tile with glow + detail using Web Mercator."""
+    # Get tile bounds using mercantile
+    bounds = mercantile.bounds(x, y, z)
+    lon_min, lat_min, lon_max, lat_max = bounds.west, bounds.south, bounds.east, bounds.north
     
-    pad_deg = (lon_max - lon_min) * 0.2  # Larger padding for antimeridian
+    # Add padding in degrees (approximate)
+    lon_range = lon_max - lon_min
+    lat_range = lat_max - lat_min
+    pad_frac = PADDING / TILE_SIZE
+    lon_pad = lon_range * pad_frac
+    lat_pad = lat_range * pad_frac
     
-    # Create copies of data that we can modify
+    lon_min_padded = lon_min - lon_pad
+    lon_max_padded = lon_max + lon_pad
+    lat_min_padded = lat_min - lat_pad
+    lat_max_padded = lat_max + lat_pad
+    
+    # Copy and wrap antimeridian
     all_lons = lons.copy()
     all_lats = lats.copy()
     all_speeds = speeds.copy()
     
-    # Add wrapped copies of points near the antimeridian
-    # Points near +180 get copied to -180 side (shifted by -360)
     east_mask = lons > 170
     if east_mask.any():
         all_lons = np.concatenate([all_lons, lons[east_mask] - 360])
         all_lats = np.concatenate([all_lats, lats[east_mask]])
         all_speeds = np.concatenate([all_speeds, speeds[east_mask]])
     
-    # Points near -180 get copied to +180 side (shifted by +360)
     west_mask = lons < -170
     if west_mask.any():
         all_lons = np.concatenate([all_lons, lons[west_mask] + 360])
         all_lats = np.concatenate([all_lats, lats[west_mask]])
         all_speeds = np.concatenate([all_speeds, speeds[west_mask]])
     
-    # Now filter to tile region
+    # Filter to tile region
     mask = (
-        (all_lons >= lon_min - pad_deg) & (all_lons <= lon_max + pad_deg) &
-        (all_lats >= lat_min - pad_deg) & (all_lats <= lat_max + pad_deg)
+        (all_lons >= lon_min_padded) & (all_lons <= lon_max_padded) &
+        (all_lats >= lat_min_padded) & (all_lats <= lat_max_padded)
     )
     
     if mask.sum() < 4:
@@ -122,34 +121,73 @@ def render_tile(lons, lats, speeds, z, x, y, lut):
     tile_lats = all_lats[mask]
     tile_speeds = all_speeds[mask]
     
-    # Render at padded size
-    padded_size = TILE_SIZE + 2 * PADDING
-    grid_lon = np.linspace(lon_min, lon_max, padded_size)
-    grid_lat = np.linspace(lat_max, lat_min, padded_size)
-    lon_mesh, lat_mesh = np.meshgrid(grid_lon, grid_lat)
+    # Create output grid - for each pixel, compute its lat/lon
+    render_size = (TILE_SIZE + 2 * PADDING) * RENDER_SCALE
     
-    # Interpolate
+    # Pixel coordinates (with padding)
+    px = np.linspace(-PADDING, TILE_SIZE + PADDING, render_size)
+    py = np.linspace(-PADDING, TILE_SIZE + PADDING, render_size)
+    px_mesh, py_mesh = np.meshgrid(px, py)
+    
+    # Convert pixel to lat/lon using mercantile
+    # Each pixel maps to a fractional tile coordinate
+    tile_frac_x = x + px_mesh / TILE_SIZE
+    tile_frac_y = y + py_mesh / TILE_SIZE
+    
+    # Convert tile fractions to lat/lon
+    n = 2 ** z
+    grid_lon = tile_frac_x / n * 360.0 - 180.0
+    
+    # Mercator Y to latitude
+    merc_y = np.pi * (1 - 2 * tile_frac_y / n)
+    grid_lat = np.degrees(np.arctan(np.sinh(merc_y)))
+    
+    # Interpolate wind speeds onto this grid
     grid_speeds = griddata(
         (tile_lons, tile_lats), tile_speeds,
-        (lon_mesh, lat_mesh),
+        (grid_lon, grid_lat),
         method='linear',
         fill_value=0
     )
     
-    # Blur at padded size
-    blur_sigma = BLUR_SCALE * (2 ** (MAX_ZOOM - z))
-    if blur_sigma > 0.5:
-        grid_speeds = gaussian_filter(grid_speeds, sigma=blur_sigma)
-    
-    # Apply colormap
+    # Nonlinear transform for punch
     normalized = np.clip(grid_speeds / 30.0, 0, 1)
-    indices = (normalized * 255).astype(np.uint8)
-    rgb = lut[indices]
+    normalized = np.power(normalized, SPEED_GAMMA)
     
-    # Crop to final tile size (remove padding)
-    rgb = rgb[PADDING:PADDING+TILE_SIZE, PADDING:PADDING+TILE_SIZE]
+    # Scale blur by zoom level
+    zoom_scale = 2 ** (MAX_ZOOM - z)
     
-    return Image.fromarray(rgb, mode='RGB')
+    # GLOW LAYER: heavy blur
+    glow_speeds = gaussian_filter(normalized, sigma=GLOW_BLUR * zoom_scale * RENDER_SCALE)
+    glow_indices = (glow_speeds * 255).astype(np.uint8)
+    glow_rgba = lut[glow_indices].astype(np.float32)
+    glow_rgba[:, :, 3] *= GLOW_OPACITY
+    
+    # DETAIL LAYER: light blur
+    detail_speeds = gaussian_filter(normalized, sigma=DETAIL_BLUR * RENDER_SCALE)
+    detail_indices = (detail_speeds * 255).astype(np.uint8)
+    detail_rgba = lut[detail_indices].astype(np.float32)
+    detail_rgba[:, :, 3] *= DETAIL_OPACITY
+    
+    # Composite: glow underneath, detail on top (alpha blending)
+    detail_alpha = detail_rgba[:, :, 3:4] / 255.0
+    composite = detail_rgba.copy()
+    composite[:, :, :3] = detail_rgba[:, :, :3] * detail_alpha + glow_rgba[:, :, :3] * (1 - detail_alpha)
+    composite[:, :, 3] = np.clip(detail_rgba[:, :, 3] + glow_rgba[:, :, 3] * (1 - detail_alpha[:, :, 0]), 0, 255)
+    
+    composite = composite.astype(np.uint8)
+    
+    # Crop padding
+    pad_px = PADDING * RENDER_SCALE
+    final_size = TILE_SIZE * RENDER_SCALE
+    composite = composite[pad_px:pad_px+final_size, pad_px:pad_px+final_size]
+    
+    # Downsample to final size
+    img = Image.fromarray(composite, 'RGBA')
+    img = img.resize((TILE_SIZE, TILE_SIZE), Image.LANCZOS)
+    
+    return img
+
 
 def main():
     log("Loading wind data...")
@@ -161,7 +199,13 @@ def main():
     speeds = np.array([p['speed'] for p in wind_data])
     log(f"Loaded {len(wind_data):,} points")
     
-    lut = create_colormap()
+    # Debug: show tile bounds
+    log("\n=== Tile bounds (mercantile) ===")
+    for ty in range(4):
+        b = mercantile.bounds(0, ty, 2)
+        log(f"Tile (2,0,{ty}): lat {b.south:.1f} to {b.north:.1f}")
+    
+    lut = create_colormap_rgba()
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
@@ -188,13 +232,14 @@ def main():
                 if img:
                     img.save(tile_path, optimize=True)
                 else:
-                    empty = Image.new('RGB', (TILE_SIZE, TILE_SIZE), (30, 30, 40))
+                    empty = Image.new('RGBA', (TILE_SIZE, TILE_SIZE), (0, 0, 0, 0))
                     empty.save(tile_path)
                 
-                if tile_count % 20 == 0:
+                if tile_count % 10 == 0:
                     log(f"  Progress: {tile_count}/{total_tiles} tiles")
     
     log(f"\n✓ Done: {tile_count} tiles saved to {OUTPUT_DIR}/")
+
 
 if __name__ == '__main__':
     main()
