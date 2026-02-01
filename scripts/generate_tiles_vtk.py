@@ -1,34 +1,31 @@
 #!/usr/bin/env python3
 """
-Generate tile pyramid for wind visualization.
-Dual-layer approach: glow + detail with alpha transparency.
-Uses mercantile for correct Web Mercator projection.
+Generate tile pyramid for wind visualization using VTK.
+Composites wind color with grayscale terrain for Zoom Earth-like effect.
 """
 
 import json
 import sys
 import os
 import numpy as np
-from scipy.interpolate import griddata
-from scipy.ndimage import gaussian_filter
-from PIL import Image
 import mercantile
+import vtk
+from PIL import Image
+from scipy.ndimage import gaussian_filter
+import urllib.request
 
 # ============ CONFIG ============
-TILE_SIZE = 256
-RENDER_SCALE = 1    # No oversampling for testing
+TILE_SIZE = 256       # Lower res for testing
+RENDER_SCALE = 1      # No oversampling
+PADDING = 24          # Smaller padding
 MIN_ZOOM = 2
-MAX_ZOOM = 3        # Just 2-3 for testing
-PADDING = 32
-OUTPUT_DIR = 'data/tiles'
+MAX_ZOOM = 3          # Just 2 zoom levels for quick test
+OUTPUT_DIR = os.path.abspath('data/tiles')
+TERRAIN_CACHE = os.path.abspath('data/terrain_cache')
 
-# Dual layer settings
-GLOW_BLUR = 4
-DETAIL_BLUR = 1
-GLOW_OPACITY = 0.5
-DETAIL_OPACITY = 0.9
-
-# Nonlinear transform exponent
+# Wind color settings
+GLOW_BLUR = 3      # Subtle glow
+DETAIL_BLUR = 0.5  # Light smoothing
 SPEED_GAMMA = 0.7
 # ================================
 
@@ -36,157 +33,266 @@ def log(msg):
     print(msg)
     sys.stdout.flush()
 
-def create_colormap_rgba():
-    """Turbo colormap with alpha based on speed."""
-    turbo = [
-        (0.190, 0.072, 0.231), (0.217, 0.110, 0.352), (0.241, 0.150, 0.466),
-        (0.259, 0.195, 0.568), (0.270, 0.245, 0.660), (0.275, 0.300, 0.740),
-        (0.272, 0.360, 0.805), (0.262, 0.423, 0.856), (0.245, 0.489, 0.894),
-        (0.222, 0.556, 0.919), (0.195, 0.622, 0.932), (0.167, 0.685, 0.933),
-        (0.142, 0.743, 0.922), (0.127, 0.794, 0.899), (0.125, 0.838, 0.866),
-        (0.142, 0.873, 0.823), (0.177, 0.901, 0.771), (0.229, 0.922, 0.710),
-        (0.296, 0.937, 0.643), (0.375, 0.946, 0.571), (0.461, 0.949, 0.496),
-        (0.550, 0.946, 0.420), (0.638, 0.937, 0.346), (0.720, 0.922, 0.278),
-        (0.795, 0.901, 0.218), (0.860, 0.873, 0.170), (0.913, 0.838, 0.137),
-        (0.954, 0.795, 0.120), (0.980, 0.745, 0.118), (0.993, 0.689, 0.127),
-        (0.992, 0.627, 0.143), (0.978, 0.562, 0.162), (0.952, 0.495, 0.178),
-        (0.916, 0.428, 0.189), (0.870, 0.363, 0.192), (0.816, 0.301, 0.187),
-        (0.756, 0.244, 0.174), (0.691, 0.193, 0.155), (0.624, 0.149, 0.132),
-        (0.555, 0.111, 0.107), (0.486, 0.080, 0.082), (0.419, 0.056, 0.058),
+
+def fetch_terrain_tile(z, x, y):
+    """Fetch grayscale hillshade tile from ESRI."""
+    cache_path = os.path.join(TERRAIN_CACHE, str(z), str(x), f"{y}.png")
+    
+    if os.path.exists(cache_path):
+        img = Image.open(cache_path).convert('L')  # Grayscale
+        # Resize to match our tile size if needed
+        if img.size != (TILE_SIZE, TILE_SIZE):
+            img = img.resize((TILE_SIZE, TILE_SIZE), Image.LANCZOS)
+        return np.array(img)
+    
+    # ESRI World Hillshade DARK (better for color overlay)
+    url = f"https://services.arcgisonline.com/arcgis/rest/services/Elevation/World_Hillshade_Dark/MapServer/tile/{z}/{y}/{x}"
+    
+    try:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        urllib.request.urlretrieve(url, cache_path)
+        img = Image.open(cache_path).convert('L')
+        # Resize to match our tile size if needed
+        if img.size != (TILE_SIZE, TILE_SIZE):
+            img = img.resize((TILE_SIZE, TILE_SIZE), Image.LANCZOS)
+        return np.array(img)
+    except Exception as e:
+        log(f"  Warning: terrain fetch failed for {z}/{x}/{y}: {e}")
+        # Return neutral gray if fetch fails
+        return np.full((TILE_SIZE, TILE_SIZE), 128, dtype=np.uint8)
+
+
+def create_colormap():
+    """Create colormap similar to Zoom Earth wind - reach red faster."""
+    # Zoom Earth style: deep blue -> cyan -> green -> yellow -> orange -> red
+    # Compressed warm colors to reach red faster
+    colors = [
+        (0.0, (30, 60, 120)),      # Deep blue (visible, not black)
+        (0.1, (40, 80, 160)),      # Blue
+        (0.2, (50, 140, 200)),     # Light blue
+        (0.3, (60, 180, 190)),     # Cyan
+        (0.4, (80, 200, 160)),     # Teal
+        (0.5, (120, 210, 100)),    # Green
+        (0.6, (180, 220, 60)),     # Yellow-green
+        (0.7, (240, 200, 50)),     # Yellow
+        (0.8, (250, 140, 50)),     # Orange
+        (0.9, (250, 80, 60)),      # Red-orange
+        (1.0, (220, 40, 40)),      # Deep red
     ]
     
-    lut = np.zeros((256, 4), dtype=np.uint8)
+    lut = np.zeros((256, 3), dtype=np.uint8)
+    
     for i in range(256):
         t = i / 255.0
-        idx = min(int(t * (len(turbo) - 1)), len(turbo) - 2)
-        frac = t * (len(turbo) - 1) - idx
         
-        r = turbo[idx][0] + frac * (turbo[idx + 1][0] - turbo[idx][0])
-        g = turbo[idx][1] + frac * (turbo[idx + 1][1] - turbo[idx][1])
-        b = turbo[idx][2] + frac * (turbo[idx + 1][2] - turbo[idx][2])
-        
-        # Alpha ramps up with speed (low speed = more transparent)
-        alpha = min(1.0, t * 1.5)  # Boost alpha curve
-        
-        lut[i] = [int(r * 255), int(g * 255), int(b * 255), int(alpha * 255)]
+        # Find the two colors to interpolate between
+        for j in range(len(colors) - 1):
+            if colors[j][0] <= t <= colors[j+1][0]:
+                t0, c0 = colors[j]
+                t1, c1 = colors[j+1]
+                frac = (t - t0) / (t1 - t0) if t1 > t0 else 0
+                
+                lut[i, 0] = int(c0[0] + frac * (c1[0] - c0[0]))
+                lut[i, 1] = int(c0[1] + frac * (c1[1] - c0[1]))
+                lut[i, 2] = int(c0[2] + frac * (c1[2] - c0[2]))
+                break
     
     return lut
 
 
-def render_tile(lons, lats, speeds, z, x, y, lut):
-    """Render dual-layer tile with glow + detail using Web Mercator."""
-    # Get tile bounds using mercantile
-    bounds = mercantile.bounds(x, y, z)
-    lon_min, lat_min, lon_max, lat_max = bounds.west, bounds.south, bounds.east, bounds.north
+def create_vtk_lut():
+    """Create VTK lookup table - Zoom Earth style, reach red faster."""
+    colors = [
+        (0.0, (30, 60, 120)),      # Deep blue (visible, not black)
+        (0.1, (40, 80, 160)),      # Blue
+        (0.2, (50, 140, 200)),     # Light blue
+        (0.3, (60, 180, 190)),     # Cyan
+        (0.4, (80, 200, 160)),     # Teal
+        (0.5, (120, 210, 100)),    # Green
+        (0.6, (180, 220, 60)),     # Yellow-green
+        (0.7, (240, 200, 50)),     # Yellow
+        (0.8, (250, 140, 50)),     # Orange
+        (0.9, (250, 80, 60)),      # Red-orange
+        (1.0, (220, 40, 40)),      # Deep red
+    ]
     
-    # Add padding in degrees (approximate)
-    lon_range = lon_max - lon_min
-    lat_range = lat_max - lat_min
-    pad_frac = PADDING / TILE_SIZE
-    lon_pad = lon_range * pad_frac
-    lat_pad = lat_range * pad_frac
+    lut = vtk.vtkLookupTable()
+    lut.SetNumberOfTableValues(256)
+    lut.SetRange(0, 30)
     
-    lon_min_padded = lon_min - lon_pad
-    lon_max_padded = lon_max + lon_pad
-    lat_min_padded = lat_min - lat_pad
-    lat_max_padded = lat_max + lat_pad
+    for i in range(256):
+        t = i / 255.0
+        
+        for j in range(len(colors) - 1):
+            if colors[j][0] <= t <= colors[j+1][0]:
+                t0, c0 = colors[j]
+                t1, c1 = colors[j+1]
+                frac = (t - t0) / (t1 - t0) if t1 > t0 else 0
+                
+                r = (c0[0] + frac * (c1[0] - c0[0])) / 255
+                g = (c0[1] + frac * (c1[1] - c0[1])) / 255
+                b = (c0[2] + frac * (c1[2] - c0[2])) / 255
+                
+                lut.SetTableValue(i, r, g, b, 1.0)  # Fully opaque
+                break
     
-    # Copy and wrap antimeridian
-    all_lons = lons.copy()
-    all_lats = lats.copy()
-    all_speeds = speeds.copy()
+    lut.Build()
+    return lut
+
+
+class TileRenderer:
+    """Reusable VTK renderer for generating tiles."""
     
-    east_mask = lons > 170
-    if east_mask.any():
-        all_lons = np.concatenate([all_lons, lons[east_mask] - 360])
-        all_lats = np.concatenate([all_lats, lats[east_mask]])
-        all_speeds = np.concatenate([all_speeds, speeds[east_mask]])
+    def __init__(self, tile_size, render_scale, padding, lut):
+        self.tile_size = tile_size
+        self.padding = padding
+        self.render_scale = render_scale
+        self.lut = lut
+        
+        self.padded_size = tile_size + 2 * padding
+        self.render_size = self.padded_size * render_scale
+        
+        self.render_window = vtk.vtkRenderWindow()
+        self.render_window.SetOffScreenRendering(1)
+        self.render_window.SetSize(self.render_size, self.render_size)
+        
+        self.renderer = vtk.vtkRenderer()
+        self.renderer.SetBackground(0, 0, 0)
+        self.render_window.AddRenderer(self.renderer)
+        
+        camera = self.renderer.GetActiveCamera()
+        camera.ParallelProjectionOn()
+        camera.SetPosition(self.render_size/2, self.render_size/2, 100)
+        camera.SetFocalPoint(self.render_size/2, self.render_size/2, 0)
+        camera.SetParallelScale(self.render_size/2)
+        
+        self.w2i = vtk.vtkWindowToImageFilter()
+        self.w2i.SetInput(self.render_window)
+        self.w2i.SetInputBufferTypeToRGB()  # No alpha needed
     
-    west_mask = lons < -170
-    if west_mask.any():
-        all_lons = np.concatenate([all_lons, lons[west_mask] + 360])
-        all_lats = np.concatenate([all_lats, lats[west_mask]])
-        all_speeds = np.concatenate([all_speeds, speeds[west_mask]])
+    def render_wind_color(self, lons, lats, speeds, z, x, y):
+        """Render wind as solid color (no alpha)."""
+        bounds = mercantile.bounds(x, y, z)
+        lon_min, lat_min, lon_max, lat_max = bounds.west, bounds.south, bounds.east, bounds.north
+        
+        lon_range = lon_max - lon_min
+        lat_range = lat_max - lat_min
+        pad_frac = self.padding / self.tile_size
+        geo_lon_pad = lon_range * (pad_frac + 0.1)
+        geo_lat_pad = lat_range * (pad_frac + 0.1)
+        
+        mask = (
+            (lons >= lon_min - geo_lon_pad) & (lons <= lon_max + geo_lon_pad) &
+            (lats >= lat_min - geo_lat_pad) & (lats <= lat_max + geo_lat_pad)
+        )
+        
+        if mask.sum() < 4:
+            return None
+        
+        tile_lons = lons[mask]
+        tile_lats = lats[mask]
+        tile_speeds = speeds[mask]
+        
+        n = 2 ** z
+        pad_px = self.padding * self.render_scale
+        
+        px = (tile_lons - lon_min) / lon_range * (self.tile_size * self.render_scale) + pad_px
+        
+        def lat_to_merc_y(lat):
+            lat_rad = np.radians(np.clip(lat, -85.05, 85.05))
+            return (1 - np.log(np.tan(lat_rad) + 1/np.cos(lat_rad)) / np.pi) / 2
+        
+        tile_merc_min = y / n
+        tile_merc_max = (y + 1) / n
+        merc_y = lat_to_merc_y(tile_lats)
+        py = (merc_y - tile_merc_min) / (tile_merc_max - tile_merc_min) * (self.tile_size * self.render_scale) + pad_px
+        
+        points = vtk.vtkPoints()
+        for i in range(len(px)):
+            points.InsertNextPoint(px[i], self.render_size - py[i], 0)
+        
+        scalars = vtk.vtkFloatArray()
+        scalars.SetName("speed")
+        for s in tile_speeds:
+            scalars.InsertNextValue(s)
+        
+        polydata = vtk.vtkPolyData()
+        polydata.SetPoints(points)
+        polydata.GetPointData().SetScalars(scalars)
+        
+        delaunay = vtk.vtkDelaunay2D()
+        delaunay.SetInputData(polydata)
+        delaunay.SetTolerance(0.001)
+        delaunay.Update()
+        
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(delaunay.GetOutputPort())
+        mapper.SetLookupTable(self.lut)
+        mapper.SetScalarRange(0, 30)
+        mapper.SetInterpolateScalarsBeforeMapping(True)
+        
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetInterpolationToGouraud()
+        
+        self.renderer.RemoveAllViewProps()
+        self.renderer.AddActor(actor)
+        self.render_window.Render()
+        
+        self.w2i.Modified()
+        self.w2i.Update()
+        
+        vtk_image = self.w2i.GetOutput()
+        width, height, _ = vtk_image.GetDimensions()
+        vtk_array = vtk_image.GetPointData().GetScalars()
+        arr = np.frombuffer(vtk_array, dtype=np.uint8).reshape(height, width, 3)
+        arr = np.flipud(arr.copy())
+        
+        # Return padded image - blur and crop happens in composite_tile
+        return arr
     
-    # Filter to tile region
-    mask = (
-        (all_lons >= lon_min_padded) & (all_lons <= lon_max_padded) &
-        (all_lats >= lat_min_padded) & (all_lats <= lat_max_padded)
-    )
-    
-    if mask.sum() < 4:
-        return None
-    
-    tile_lons = all_lons[mask]
-    tile_lats = all_lats[mask]
-    tile_speeds = all_speeds[mask]
-    
-    # Create output grid - for each pixel, compute its lat/lon
-    render_size = (TILE_SIZE + 2 * PADDING) * RENDER_SCALE
-    
-    # Pixel coordinates (with padding)
-    px = np.linspace(-PADDING, TILE_SIZE + PADDING, render_size)
-    py = np.linspace(-PADDING, TILE_SIZE + PADDING, render_size)
-    px_mesh, py_mesh = np.meshgrid(px, py)
-    
-    # Convert pixel to lat/lon using mercantile
-    # Each pixel maps to a fractional tile coordinate
-    tile_frac_x = x + px_mesh / TILE_SIZE
-    tile_frac_y = y + py_mesh / TILE_SIZE
-    
-    # Convert tile fractions to lat/lon
-    n = 2 ** z
-    grid_lon = tile_frac_x / n * 360.0 - 180.0
-    
-    # Mercator Y to latitude
-    merc_y = np.pi * (1 - 2 * tile_frac_y / n)
-    grid_lat = np.degrees(np.arctan(np.sinh(merc_y)))
-    
-    # Interpolate wind speeds onto this grid
-    grid_speeds = griddata(
-        (tile_lons, tile_lats), tile_speeds,
-        (grid_lon, grid_lat),
-        method='linear',
-        fill_value=0
-    )
-    
-    # Nonlinear transform for punch
-    normalized = np.clip(grid_speeds / 30.0, 0, 1)
-    normalized = np.power(normalized, SPEED_GAMMA)
-    
-    # Scale blur by zoom level
-    zoom_scale = 2 ** (MAX_ZOOM - z)
-    
-    # GLOW LAYER: heavy blur
-    glow_speeds = gaussian_filter(normalized, sigma=GLOW_BLUR * zoom_scale * RENDER_SCALE)
-    glow_indices = (glow_speeds * 255).astype(np.uint8)
-    glow_rgba = lut[glow_indices].astype(np.float32)
-    glow_rgba[:, :, 3] *= GLOW_OPACITY
-    
-    # DETAIL LAYER: light blur
-    detail_speeds = gaussian_filter(normalized, sigma=DETAIL_BLUR * RENDER_SCALE)
-    detail_indices = (detail_speeds * 255).astype(np.uint8)
-    detail_rgba = lut[detail_indices].astype(np.float32)
-    detail_rgba[:, :, 3] *= DETAIL_OPACITY
-    
-    # Composite: glow underneath, detail on top (alpha blending)
-    detail_alpha = detail_rgba[:, :, 3:4] / 255.0
-    composite = detail_rgba.copy()
-    composite[:, :, :3] = detail_rgba[:, :, :3] * detail_alpha + glow_rgba[:, :, :3] * (1 - detail_alpha)
-    composite[:, :, 3] = np.clip(detail_rgba[:, :, 3] + glow_rgba[:, :, 3] * (1 - detail_alpha[:, :, 0]), 0, 255)
-    
-    composite = composite.astype(np.uint8)
-    
-    # Crop padding
-    pad_px = PADDING * RENDER_SCALE
-    final_size = TILE_SIZE * RENDER_SCALE
-    composite = composite[pad_px:pad_px+final_size, pad_px:pad_px+final_size]
-    
-    # Downsample to final size
-    img = Image.fromarray(composite, 'RGBA')
-    img = img.resize((TILE_SIZE, TILE_SIZE), Image.LANCZOS)
-    
-    return img
+    def composite_tile(self, wind_rgb_padded, terrain_gray):
+        """Blend wind color with terrain - apply blur BEFORE cropping."""
+        
+        # Apply glow blur to padded image (before crop!)
+        glow = np.zeros_like(wind_rgb_padded, dtype=float)
+        for c in range(3):
+            glow[:, :, c] = gaussian_filter(wind_rgb_padded[:, :, c].astype(float), sigma=GLOW_BLUR)
+        
+        # Apply detail blur to padded image
+        detail = np.zeros_like(wind_rgb_padded, dtype=float)
+        for c in range(3):
+            detail[:, :, c] = gaussian_filter(wind_rgb_padded[:, :, c].astype(float), sigma=DETAIL_BLUR)
+        
+        # Combine glow and detail - favor detail to preserve reds
+        wind_combined = (glow * 0.2 + detail * 0.8)
+        
+        # NOW crop the padding (after blur)
+        crop_start = self.padding * self.render_scale
+        crop_end = crop_start + self.tile_size * self.render_scale
+        wind_cropped = wind_combined[crop_start:crop_end, crop_start:crop_end]
+        
+        # Resize terrain to match cropped wind
+        if terrain_gray.shape[0] != wind_cropped.shape[0]:
+            terrain_img = Image.fromarray(terrain_gray)
+            terrain_img = terrain_img.resize((wind_cropped.shape[1], wind_cropped.shape[0]), Image.LANCZOS)
+            terrain_gray = np.array(terrain_img)
+        
+        # Normalize terrain to 0-1, boost it significantly
+        terrain_norm = terrain_gray.astype(float) / 255.0
+        terrain_norm = np.clip(terrain_norm * 2.0, 0, 1)  # Brighten terrain a lot
+        
+        # Screen blend: result = 1 - (1-terrain) * (1-wind)
+        result = np.zeros((wind_cropped.shape[0], wind_cropped.shape[1], 3), dtype=float)
+        for c in range(3):
+            w = wind_cropped[:, :, c] / 255.0
+            t = terrain_norm
+            result[:, :, c] = 1 - (1 - t * 0.3) * (1 - w)
+        
+        # Boost saturation and brightness
+        result = np.clip(result * 255 * 1.3, 0, 255).astype(np.uint8)
+        
+        return result
 
 
 def main():
@@ -199,15 +305,40 @@ def main():
     speeds = np.array([p['speed'] for p in wind_data])
     log(f"Loaded {len(wind_data):,} points")
     
-    # Debug: show tile bounds
-    log("\n=== Tile bounds (mercantile) ===")
-    for ty in range(4):
-        b = mercantile.bounds(0, ty, 2)
-        log(f"Tile (2,0,{ty}): lat {b.south:.1f} to {b.north:.1f}")
+    # Handle antimeridian wrapping
+    east_mask = lons > 170
+    west_mask = lons < -170
     
-    lut = create_colormap_rgba()
+    all_lons = lons.copy()
+    all_lats = lats.copy()
+    all_speeds = speeds.copy()
     
+    if east_mask.any():
+        all_lons = np.concatenate([all_lons, lons[east_mask] - 360])
+        all_lats = np.concatenate([all_lats, lats[east_mask]])
+        all_speeds = np.concatenate([all_speeds, speeds[east_mask]])
+    if west_mask.any():
+        all_lons = np.concatenate([all_lons, lons[west_mask] + 360])
+        all_lats = np.concatenate([all_lats, lats[west_mask]])
+        all_speeds = np.concatenate([all_speeds, speeds[west_mask]])
+    
+    lons, lats, speeds = all_lons, all_lats, all_speeds
+    log(f"After wrapping: {len(lons):,} points")
+    
+    # Create renderer
+    lut = create_vtk_lut()
+    tile_renderer = TileRenderer(TILE_SIZE, RENDER_SCALE, PADDING, lut)
+    log("VTK renderer initialized")
+    
+    # Create directories
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(TERRAIN_CACHE, exist_ok=True)
+    
+    for z in range(MIN_ZOOM, MAX_ZOOM + 1):
+        n_tiles = 2 ** z
+        for tx in range(n_tiles):
+            os.makedirs(os.path.join(OUTPUT_DIR, str(z), str(tx)), exist_ok=True)
+    log("Created directories")
     
     total_tiles = sum(4 ** z for z in range(MIN_ZOOM, MAX_ZOOM + 1))
     tile_count = 0
@@ -216,24 +347,34 @@ def main():
         n_tiles = 2 ** z
         log(f"\nZoom {z}: {n_tiles}x{n_tiles} tiles")
         
-        zoom_dir = os.path.join(OUTPUT_DIR, str(z))
-        os.makedirs(zoom_dir, exist_ok=True)
-        
-        for x in range(n_tiles):
-            x_dir = os.path.join(zoom_dir, str(x))
-            os.makedirs(x_dir, exist_ok=True)
-            
-            for y in range(n_tiles):
+        for tx in range(n_tiles):
+            for ty in range(n_tiles):
                 tile_count += 1
-                tile_path = os.path.join(x_dir, f"{y}.png")
+                tile_dir = os.path.join(OUTPUT_DIR, str(z), str(tx))
+                tile_path = os.path.join(tile_dir, f"{ty}.png")
                 
-                img = render_tile(lons, lats, speeds, z, x, y, lut)
+                # Ensure directory exists
+                os.makedirs(tile_dir, exist_ok=True)
                 
-                if img:
-                    img.save(tile_path, optimize=True)
-                else:
-                    empty = Image.new('RGBA', (TILE_SIZE, TILE_SIZE), (0, 0, 0, 0))
+                # Render wind color
+                wind_rgb = tile_renderer.render_wind_color(lons, lats, speeds, z, tx, ty)
+                
+                if wind_rgb is None:
+                    empty = Image.new('RGB', (TILE_SIZE, TILE_SIZE), (0, 0, 0))
                     empty.save(tile_path)
+                    continue
+                
+                # Fetch terrain
+                terrain_gray = fetch_terrain_tile(z, tx, ty)
+                
+                # Composite
+                result = tile_renderer.composite_tile(wind_rgb, terrain_gray)
+                
+                # Save
+                img = Image.fromarray(result)
+                if img.size != (TILE_SIZE, TILE_SIZE):
+                    img = img.resize((TILE_SIZE, TILE_SIZE), Image.LANCZOS)
+                img.save(tile_path, optimize=True)
                 
                 if tile_count % 10 == 0:
                     log(f"  Progress: {tile_count}/{total_tiles} tiles")
