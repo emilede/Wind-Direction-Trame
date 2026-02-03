@@ -1,41 +1,84 @@
-import json
+"""
+Wind visualization with pre-rendered tiles.
+"""
+
+import os
+import time
+from aiohttp import web
 from trame.app import get_server
 from trame.ui.vuetify3 import SinglePageLayout
-from trame.widgets import plotly
-import plotly.express as px # type: ignore
+from trame.widgets import vuetify3 as v3, leaflet3 as leaflet
 
-# Load wind data
-with open('data/wind_data.json') as f:
-    wind_data = json.load(f)
+# Cache buster - change this or use timestamp
+CACHE_BUST = int(time.time())
 
-print(f"Loaded {len(wind_data):,} wind points")
-
-# Create figure
-fig = px.scatter_map(
-    wind_data, 
-    lat='lat', 
-    lon='lon', 
-    color='speed',
-    color_continuous_scale='Turbo', 
-    zoom=1,
-    center={'lat': 20, 'lon': 0}, 
-    opacity=0.7
-)
-fig.update_traces(marker=dict(size=4))
-fig.update_layout(
-    mapbox_style='carto-darkmatter', 
-    margin=dict(l=0, r=0, t=0, b=0)
-)
-
-# Trame setup
-server = get_server()
+server = get_server(client_type="vue3")
 state = server.state
-state.trame__title = 'Wind Speed'
+state.trame__title = "Wind Speed"
+
+# Tile serving handler
+async def serve_tile(request):
+    z = request.match_info['z']
+    x = request.match_info['x']
+    y = request.match_info['y']
+    tile_path = f"./data/tiles/{z}/{x}/{y}.png"
+    
+    if os.path.exists(tile_path):
+        response = web.FileResponse(tile_path)
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+        return response
+    return web.Response(status=404)
+
+# Border tile serving handler
+async def serve_border_tile(request):
+    z = request.match_info['z']
+    x = request.match_info['x']
+    y = request.match_info['y']
+    tile_path = f"./data/border_tiles/{z}/{x}/{y}.png"
+    
+    if os.path.exists(tile_path):
+        response = web.FileResponse(tile_path)
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+        return response
+    return web.Response(status=404)
+
+# Register routes after server is ready
+@server.controller.add("on_server_bind")
+def on_bind(wslink_server):
+    wslink_server.app.router.add_get("/tiles/{z}/{x}/{y}.png", serve_tile)
+    wslink_server.app.router.add_get("/borders/{z}/{x}/{y}.png", serve_border_tile)
 
 with SinglePageLayout(server) as layout:
-    layout.title.set_text('Wind Speed')
+    layout.title.set_text("Wind Speed")
+    
     with layout.content:
-        plotly.Figure(figure=fig, style='height: 100%; width: 100%;')
+        with v3.VContainer(fluid=True, classes="fill-height pa-0"):
+            with leaflet.LMap(
+                zoom=("zoom", 2),
+                center=("center", [20, 0]),
+                world_copy_jump=True,
+                max_zoom=3,
+                min_zoom=2,
+                style="height: 100%; width: 100%;",
+            ):
+                # Wind tiles (composited with terrain)
+                leaflet.LTileLayer(
+                    url=("wind_url", f"/tiles/{{z}}/{{x}}/{{y}}.png?v={CACHE_BUST}"),
+                    opacity=1.0,
+                    minZoom=2,
+                    maxZoom=3,
+                )
+                # Border tiles (transparent with black lines)
+                leaflet.LTileLayer(
+                    url=("border_url", f"/borders/{{z}}/{{x}}/{{y}}.png?v={CACHE_BUST}"),
+                    opacity=1.0,
+                    minZoom=2,
+                    maxZoom=3,
+                )
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     server.start()
