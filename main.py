@@ -61,8 +61,8 @@ with SinglePageLayout(server) as layout:
                 zoom=("zoom", 2),
                 center=("center", [20, 0]),
                 world_copy_jump=True,
-                max_zoom=3,
-                min_zoom=2,
+                max_zoom=4,
+                min_zoom=3,
                 style="height: 100%; width: 100%;",
             ):
                 # Wind tiles (composited with terrain)

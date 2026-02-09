@@ -7,6 +7,7 @@ import xarray as xr # type: ignore
 import json
 import numpy as np
 import math
+from scipy.interpolate import RegularGridInterpolator
 
 def main():
     print("Loading GRIB2 file...")
@@ -28,43 +29,61 @@ def main():
     print(f"Latitude range: {lats.min()} to {lats.max()}")
     print(f"Longitude range: {lons.min()} to {lons.max()}")
     
-    # Convert to list of points with lat, lon, u, v, speed, direction
+    # Interpolate to finer grid (0.125° spacing)
+    target_step = 0.125
+    target_lats = np.arange(lats.min(), lats.max() + target_step, target_step)
+    target_lons = np.arange(lons.min(), lons.max() + target_step, target_step)
+    
+    print(f"Interpolating from {len(lats)}x{len(lons)} to {len(target_lats)}x{len(target_lons)}...")
+    
+    # RegularGridInterpolator expects ascending axes
+    # GFS lats are typically descending (90 to -90), so flip
+    if lats[0] > lats[-1]:
+        lats_asc = lats[::-1]
+        u10_asc = u10[::-1, :]
+        v10_asc = v10[::-1, :]
+    else:
+        lats_asc = lats
+        u10_asc = u10
+        v10_asc = v10
+    
+    interp_u = RegularGridInterpolator((lats_asc, lons), u10_asc, method='cubic', bounds_error=False, fill_value=None)
+    interp_v = RegularGridInterpolator((lats_asc, lons), v10_asc, method='cubic', bounds_error=False, fill_value=None)
+    
+    target_lat_mesh, target_lon_mesh = np.meshgrid(target_lats, target_lons, indexing='ij')
+    points = np.column_stack([target_lat_mesh.ravel(), target_lon_mesh.ravel()])
+    
+    u_fine = interp_u(points)
+    v_fine = interp_v(points)
+    
+    print(f"Interpolation done. Building JSON...")
+    
     wind_data = []
-    
-    # Sample every N points to reduce data size (0.25° grid is very dense)
-    # Original: 721 x 1440 = 1,038,240 points
-    # Sample every 4 = ~65,000 points (similar to 1° grid)
-    step = 4
-    
-    for i, lat in enumerate(lats[::step]):
-        for j, lon in enumerate(lons[::step]):
-            u = float(u10[i * step, j * step])
-            v = float(v10[i * step, j * step])
-            
-            # Calculate speed and direction
-            speed = math.sqrt(u**2 + v**2)
-            
-            # Direction: meteorological convention (where wind comes FROM)
-            # atan2 gives angle of where wind is going TO, so add 180°
-            direction = (math.degrees(math.atan2(-u, -v)) + 360) % 360
-            
-            # Convert longitude from 0-360 to -180 to 180
-            lon_converted = lon if lon <= 180 else lon - 360
-            
-            wind_data.append({
-                'lat': float(lat),
-                'lon': float(lon_converted),
-                'u': round(u, 2),
-                'v': round(v, 2),
-                'speed': round(speed, 2),
-                'direction': round(direction, 1)
-            })
+    for i in range(len(points)):
+        u = float(u_fine[i])
+        v = float(v_fine[i])
+        lat = float(points[i, 0])
+        lon = float(points[i, 1])
+        
+        speed = math.sqrt(u**2 + v**2)
+        direction = (math.degrees(math.atan2(-u, -v)) + 360) % 360
+        
+        lon_converted = lon if lon <= 180 else lon - 360
+        
+        wind_data.append({
+            'lat': lat,
+            'lon': round(lon_converted, 3),
+            'u': round(u, 2),
+            'v': round(v, 2),
+            'speed': round(speed, 2),
+            'direction': round(direction, 1)
+        })
     
     print(f"\nTotal points: {len(wind_data)}")
     print(f"Sample point: {wind_data[1000]}")
     
     # Save to JSON
-    output_file = 'wind_data.json'
+    output_file = 'data/wind_data.json'
     with open(output_file, 'w') as f:
         json.dump(wind_data, f)
     

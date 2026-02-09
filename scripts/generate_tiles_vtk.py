@@ -18,8 +18,8 @@ import urllib.request
 TILE_SIZE = 256       # Output tile size
 RENDER_SCALE = 4      # 4x oversampling - Lanczos downsample smooths edges
 PADDING = 32          # Padding for blur
-MIN_ZOOM = 2
-MAX_ZOOM = 3          # 80 tiles (reduced for faster rendering)
+MIN_ZOOM = 3
+MAX_ZOOM = 4          # 80 tiles (reduced for faster rendering)
 OUTPUT_DIR = os.path.abspath('data/tiles')
 TERRAIN_CACHE = os.path.abspath('data/terrain_cache')
 
