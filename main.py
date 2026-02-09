@@ -70,14 +70,14 @@ with SinglePageLayout(server) as layout:
                     url=("wind_url", f"/tiles/{{z}}/{{x}}/{{y}}.png?v={CACHE_BUST}"),
                     opacity=1.0,
                     minZoom=2,
-                    maxZoom=3,
+                    maxZoom=5,
                 )
                 # Border tiles (transparent with black lines)
                 leaflet.LTileLayer(
                     url=("border_url", f"/borders/{{z}}/{{x}}/{{y}}.png?v={CACHE_BUST}"),
                     opacity=1.0,
                     minZoom=2,
-                    maxZoom=3,
+                    maxZoom=5,
                 )
 
 if __name__ == "__main__":

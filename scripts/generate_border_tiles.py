@@ -13,7 +13,7 @@ import math
 # ============ CONFIG ============
 TILE_SIZE = 256       # Match wind tiles
 MIN_ZOOM = 2
-MAX_ZOOM = 3
+MAX_ZOOM = 5
 OUTPUT_DIR = 'data/border_tiles'
 GEOJSON_DIR = 'data/geojson'
 
