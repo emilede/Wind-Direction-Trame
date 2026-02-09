@@ -15,17 +15,17 @@ from scipy.ndimage import gaussian_filter
 import urllib.request
 
 # ============ CONFIG ============
-TILE_SIZE = 256       # Lower res for testing
-RENDER_SCALE = 1      # No oversampling
-PADDING = 24          # Smaller padding
+TILE_SIZE = 256       # Output tile size
+RENDER_SCALE = 4      # 4x oversampling - Lanczos downsample smooths edges
+PADDING = 32          # Padding for blur
 MIN_ZOOM = 2
-MAX_ZOOM = 3          # Just 2 zoom levels for quick test
+MAX_ZOOM = 3          # 80 tiles (reduced for faster rendering)
 OUTPUT_DIR = os.path.abspath('data/tiles')
 TERRAIN_CACHE = os.path.abspath('data/terrain_cache')
 
 # Wind color settings
-GLOW_BLUR = 3      # Subtle glow
-DETAIL_BLUR = 0.5  # Light smoothing
+GLOW_BLUR = 1      # Minimal blur - preserve sharp transitions
+DETAIL_BLUR = 0.3  # Light smoothing
 SPEED_GAMMA = 0.7
 # ================================
 
@@ -62,66 +62,83 @@ def fetch_terrain_tile(z, x, y):
         return np.full((TILE_SIZE, TILE_SIZE), 128, dtype=np.uint8)
 
 
-def create_colormap():
-    """Create colormap similar to Zoom Earth wind - reach red faster."""
-    # Zoom Earth style: deep blue -> cyan -> green -> yellow -> orange -> red
-    # Compressed warm colors to reach red faster
-    colors = [
-        (0.0, (30, 60, 120)),      # Deep blue (visible, not black)
-        (0.1, (40, 80, 160)),      # Blue
-        (0.2, (50, 140, 200)),     # Light blue
-        (0.3, (60, 180, 190)),     # Cyan
-        (0.4, (80, 200, 160)),     # Teal
-        (0.5, (120, 210, 100)),    # Green
-        (0.6, (180, 220, 60)),     # Yellow-green
-        (0.7, (240, 200, 50)),     # Yellow
-        (0.8, (250, 140, 50)),     # Orange
-        (0.9, (250, 80, 60)),      # Red-orange
-        (1.0, (220, 40, 40)),      # Deep red
-    ]
-    
-    lut = np.zeros((256, 3), dtype=np.uint8)
-    
-    for i in range(256):
-        t = i / 255.0
-        
-        # Find the two colors to interpolate between
-        for j in range(len(colors) - 1):
-            if colors[j][0] <= t <= colors[j+1][0]:
-                t0, c0 = colors[j]
-                t1, c1 = colors[j+1]
-                frac = (t - t0) / (t1 - t0) if t1 > t0 else 0
-                
-                lut[i, 0] = int(c0[0] + frac * (c1[0] - c0[0]))
-                lut[i, 1] = int(c0[1] + frac * (c1[1] - c0[1]))
-                lut[i, 2] = int(c0[2] + frac * (c1[2] - c0[2]))
-                break
-    
-    return lut
-
-
 def create_vtk_lut():
-    """Create VTK lookup table - Zoom Earth style, reach red faster."""
+    """Create VTK lookup table with bell curve saturation.
+    Darkest at 0 and 35, brightest around 15-20 m/s (middle)."""
     colors = [
-        (0.0, (30, 60, 120)),      # Deep blue (visible, not black)
-        (0.1, (40, 80, 160)),      # Blue
-        (0.2, (50, 140, 200)),     # Light blue
-        (0.3, (60, 180, 190)),     # Cyan
-        (0.4, (80, 200, 160)),     # Teal
-        (0.5, (120, 210, 100)),    # Green
-        (0.6, (180, 220, 60)),     # Yellow-green
-        (0.7, (240, 200, 50)),     # Yellow
-        (0.8, (250, 140, 50)),     # Orange
-        (0.9, (250, 80, 60)),      # Red-orange
-        (1.0, (220, 40, 40)),      # Deep red
+        # 0 m/s - bluish purple (DARK)
+        (0.000, (30, 20, 80)),
+        
+        # 1 m/s - dark blue
+        (0.029, (20, 30, 100)),
+        
+        # 3 m/s - blue
+        (0.086, (35, 60, 140)),
+        
+        # 5 m/s - light blue
+        (0.143, (50, 100, 180)),
+        
+        # 7.5 m/s - light blue (brighter)
+        (0.214, (60, 130, 190)),
+        
+        # 10 m/s - cyan (bright)
+        (0.286, (70, 190, 210)),
+        
+        # 11 m/s - cyan-green (bright)
+        (0.314, (60, 210, 160)),
+        
+        # 12 m/s - green (toned down)
+        (0.343, (50, 180, 70)),
+        
+        # 13 m/s - bright green (toned down)
+        (0.371, (100, 190, 55)),
+        
+        # 14 m/s - lime (toned down)
+        (0.400, (150, 200, 50)),
+        
+        # 15 m/s - yellow (BRIGHTEST)
+        (0.429, (240, 240, 70)),
+        
+        # 16 m/s - yellow-gold (BRIGHTEST)
+        (0.457, (250, 220, 60)),
+        
+        # 17.5 m/s - gold (BRIGHTEST - peak)
+        (0.500, (255, 200, 50)),
+        
+        # 19 m/s - gold-orange (bright)
+        (0.543, (250, 160, 45)),
+        
+        # 20 m/s - orange (bright)
+        (0.571, (245, 120, 45)),
+        
+        # 21.5 m/s - orange-red (getting darker)
+        (0.614, (220, 90, 50)),
+        
+        # 23 m/s - red-orange (darker)
+        (0.657, (190, 65, 55)),
+        
+        # 25 m/s - deep red (dark)
+        (0.714, (160, 50, 60)),
+        
+        # 27.5 m/s - red-magenta (darker)
+        (0.786, (140, 40, 75)),
+        
+        # 30 m/s - magenta (dark)
+        (0.857, (120, 35, 85)),
+        
+        # 32.5 m/s - dark magenta (DARK)
+        (0.929, (100, 30, 80)),
+        
+        # 35 m/s - deep magenta (DARKEST)
+        (1.000, (80, 25, 70)),
     ]
     
     lut = vtk.vtkLookupTable()
-    lut.SetNumberOfTableValues(256)
-    lut.SetRange(0, 30)
+    lut.SetNumberOfTableValues(1024)  # Higher resolution for smoother gradients
+    lut.SetRange(0, 35)  # 0-35 m/s
     
-    for i in range(256):
-        t = i / 255.0
+    for i in range(1024):
+        t = i / 1023.0
         
         for j in range(len(colors) - 1):
             if colors[j][0] <= t <= colors[j+1][0]:
@@ -194,19 +211,31 @@ class TileRenderer:
         tile_speeds = speeds[mask]
         
         n = 2 ** z
-        pad_px = self.padding * self.render_scale
         
-        px = (tile_lons - lon_min) / lon_range * (self.tile_size * self.render_scale) + pad_px
+        # Calculate padded bounds (in geographic coordinates)
+        pad_frac = self.padding / self.tile_size
+        padded_lon_min = lon_min - lon_range * pad_frac
+        padded_lon_max = lon_max + lon_range * pad_frac
         
         def lat_to_merc_y(lat):
             lat_rad = np.radians(np.clip(lat, -85.05, 85.05))
             return (1 - np.log(np.tan(lat_rad) + 1/np.cos(lat_rad)) / np.pi) / 2
         
+        def merc_y_to_lat(merc_y):
+            return np.degrees(np.arctan(np.sinh(np.pi * (1 - 2 * merc_y))))
+        
         tile_merc_min = y / n
         tile_merc_max = (y + 1) / n
-        merc_y = lat_to_merc_y(tile_lats)
-        py = (merc_y - tile_merc_min) / (tile_merc_max - tile_merc_min) * (self.tile_size * self.render_scale) + pad_px
+        merc_range = tile_merc_max - tile_merc_min
+        padded_merc_min = tile_merc_min - merc_range * pad_frac
+        padded_merc_max = tile_merc_max + merc_range * pad_frac
         
+        # Project source points to pixel coordinates
+        px = (tile_lons - padded_lon_min) / (padded_lon_max - padded_lon_min) * self.render_size
+        merc_y = lat_to_merc_y(tile_lats)
+        py = (merc_y - padded_merc_min) / (padded_merc_max - padded_merc_min) * self.render_size
+        
+        # Create source points for Delaunay triangulation
         points = vtk.vtkPoints()
         for i in range(len(px)):
             points.InsertNextPoint(px[i], self.render_size - py[i], 0)
@@ -220,15 +249,37 @@ class TileRenderer:
         polydata.SetPoints(points)
         polydata.GetPointData().SetScalars(scalars)
         
+        # Triangulate the scattered points
         delaunay = vtk.vtkDelaunay2D()
         delaunay.SetInputData(polydata)
         delaunay.SetTolerance(0.001)
         delaunay.Update()
         
+        # Subdivide triangles for smoother color transitions
+        subdivide = vtk.vtkLinearSubdivisionFilter()
+        subdivide.SetInputConnection(delaunay.GetOutputPort())
+        subdivide.SetNumberOfSubdivisions(2)  # Each triangle -> 16 smaller triangles
+        subdivide.Update()
+        
+        # DIAGNOSTIC
+        if not hasattr(self, '_diag_count'):
+            self._diag_count = 0
+        self._diag_count += 1
+        
+        if self._diag_count <= 3 or tile_speeds.max() > 20:
+            log(f"\n  === DIAGNOSTIC for tile {z}/{x}/{y} ===")
+            log(f"  Input speeds: min={tile_speeds.min():.2f}, max={tile_speeds.max():.2f}")
+            d_scalars = subdivide.GetOutput().GetPointData().GetScalars()
+            if d_scalars:
+                d_range = d_scalars.GetRange()
+                log(f"  Subdivided scalars: min={d_range[0]:.2f}, max={d_range[1]:.2f}")
+            log(f"  ===========================")
+        
+        # Render subdivided mesh with Gouraud shading
         mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputConnection(delaunay.GetOutputPort())
+        mapper.SetInputConnection(subdivide.GetOutputPort())
         mapper.SetLookupTable(self.lut)
-        mapper.SetScalarRange(0, 30)
+        mapper.SetScalarRange(0, 35)
         mapper.SetInterpolateScalarsBeforeMapping(True)
         
         actor = vtk.vtkActor()
@@ -289,8 +340,8 @@ class TileRenderer:
             t = terrain_norm
             result[:, :, c] = 1 - (1 - t * 0.3) * (1 - w)
         
-        # Boost saturation and brightness
-        result = np.clip(result * 255 * 1.3, 0, 255).astype(np.uint8)
+        # Mild brightness boost - preserve dark colors
+        result = np.clip(result * 255 * 1.1, 0, 255).astype(np.uint8)
         
         return result
 
@@ -304,6 +355,7 @@ def main():
     lats = np.array([p['lat'] for p in wind_data])
     speeds = np.array([p['speed'] for p in wind_data])
     log(f"Loaded {len(wind_data):,} points")
+    log(f"GLOBAL SPEEDS: min={speeds.min():.2f}, max={speeds.max():.2f}, mean={speeds.mean():.2f} m/s")
     
     # Handle antimeridian wrapping
     east_mask = lons > 170
