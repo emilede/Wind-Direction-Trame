@@ -210,3 +210,4 @@ __marimo__/
 data/
 .claude/
 scripts/create_png.txt
+gfs_wind.grib2

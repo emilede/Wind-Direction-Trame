@@ -19,7 +19,7 @@ TILE_SIZE = 256       # Output tile size
 RENDER_SCALE = 4      # 4x oversampling - Lanczos downsample smooths edges
 PADDING = 32          # Padding for blur
 MIN_ZOOM = 3
-MAX_ZOOM = 4          # 80 tiles (reduced for faster rendering)
+MAX_ZOOM = 3         # 80 tiles (reduced for faster rendering)
 OUTPUT_DIR = os.path.abspath('data/tiles')
 TERRAIN_CACHE = os.path.abspath('data/terrain_cache')
 
@@ -66,71 +66,68 @@ def create_vtk_lut():
     """Create VTK lookup table with bell curve saturation.
     Darkest at 0 and 35, brightest around 15-20 m/s (middle)."""
     colors = [
-        # 0 m/s - bluish purple (DARK)
-        (0.000, (30, 20, 80)),
-        
-        # 1 m/s - dark blue
-        (0.029, (20, 30, 100)),
-        
-        # 3 m/s - blue
-        (0.086, (35, 60, 140)),
-        
-        # 5 m/s - light blue
-        (0.143, (50, 100, 180)),
-        
-        # 7.5 m/s - light blue (brighter)
-        (0.214, (60, 130, 190)),
-        
-        # 10 m/s - cyan (bright)
-        (0.286, (70, 190, 210)),
-        
-        # 11 m/s - cyan-green (bright)
-        (0.314, (60, 210, 160)),
-        
-        # 12 m/s - green (toned down)
-        (0.343, (50, 180, 70)),
-        
-        # 13 m/s - bright green (toned down)
-        (0.371, (100, 190, 55)),
-        
-        # 14 m/s - lime (toned down)
-        (0.400, (150, 200, 50)),
-        
-        # 15 m/s - yellow (BRIGHTEST)
-        (0.429, (240, 240, 70)),
-        
-        # 16 m/s - yellow-gold (BRIGHTEST)
-        (0.457, (250, 220, 60)),
-        
-        # 17.5 m/s - gold (BRIGHTEST - peak)
-        (0.500, (255, 200, 50)),
-        
-        # 19 m/s - gold-orange (bright)
-        (0.543, (250, 160, 45)),
-        
-        # 20 m/s - orange (bright)
-        (0.571, (245, 120, 45)),
-        
-        # 21.5 m/s - orange-red (getting darker)
-        (0.614, (220, 90, 50)),
-        
-        # 23 m/s - red-orange (darker)
-        (0.657, (190, 65, 55)),
-        
-        # 25 m/s - deep red (dark)
-        (0.714, (160, 50, 60)),
-        
-        # 27.5 m/s - red-magenta (darker)
-        (0.786, (140, 40, 75)),
-        
-        # 30 m/s - magenta (dark)
-        (0.857, (120, 35, 85)),
-        
-        # 32.5 m/s - dark magenta (DARK)
-        (0.929, (100, 30, 80)),
-        
-        # 35 m/s - deep magenta (DARKEST)
-        (1.000, (80, 25, 70)),
+        # 0 m/s (0 mph) - dark teal
+        (0.000, (15, 35, 55)),
+
+        # 1 m/s (2 mph) - dark teal
+        (0.029, (18, 45, 65)),
+
+        # 2 m/s (4 mph) - teal
+        (0.057, (20, 60, 80)),
+
+        # 3 m/s (7 mph) - teal-cyan
+        (0.086, (25, 80, 105)),
+
+        # 4.5 m/s (10 mph) - cyan
+        (0.129, (35, 110, 135)),
+
+        # 6 m/s (13 mph) - cyan-green
+        (0.171, (40, 145, 130)),
+
+        # 7.5 m/s (17 mph) - green-teal
+        (0.214, (45, 165, 100)),
+
+        # 9 m/s (20 mph) - green
+        (0.257, (60, 180, 65)),
+
+        # 10.5 m/s (23 mph) - bright green
+        (0.300, (110, 195, 50)),
+
+        # 12 m/s (27 mph) - yellow-green
+        (0.343, (170, 210, 45)),
+
+        # 13.5 m/s (30 mph) - yellow (BRIGHT)
+        (0.386, (220, 220, 50)),
+
+        # 15 m/s (34 mph) - gold (PEAK)
+        (0.429, (245, 200, 45)),
+
+        # 17 m/s (38 mph) - orange-gold
+        (0.486, (245, 160, 40)),
+
+        # 19 m/s (42 mph) - orange
+        (0.543, (235, 115, 40)),
+
+        # 21 m/s (47 mph) - red-orange
+        (0.600, (215, 80, 40)),
+
+        # 23 m/s (51 mph) - red
+        (0.657, (185, 55, 45)),
+
+        # 25 m/s (56 mph) - deep red
+        (0.714, (155, 40, 55)),
+
+        # 27.5 m/s (62 mph) - red-magenta
+        (0.786, (125, 30, 65)),
+
+        # 30 m/s (67 mph) - dark magenta
+        (0.857, (95, 25, 60)),
+
+        # 32.5 m/s (73 mph) - deep purple
+        (0.929, (70, 20, 50)),
+
+        # 35 m/s (78 mph) - near-black purple
+        (1.000, (50, 15, 40)),
     ]
     
     lut = vtk.vtkLookupTable()
