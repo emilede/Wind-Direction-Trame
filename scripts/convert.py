@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Convert GFS GRIB2 wind data to JSON format for visualization.
+Also saves a .npz grid file for direct use by tile generator (avoids JSON float issues).
 """
 
 import xarray as xr  # type: ignore
@@ -21,8 +22,8 @@ def main():
     print(ds)
 
     # Extract U and V wind components
-    u10 = ds['u10'].values  # U-component of wind at 10m
-    v10 = ds['v10'].values  # V-component of wind at 10m
+    u10 = ds['u10'].values
+    v10 = ds['v10'].values
     lats = ds['latitude'].values
     lons = ds['longitude'].values
 
@@ -38,7 +39,6 @@ def main():
     print(f"Interpolating from {len(lats)}x{len(lons)} to {len(target_lats)}x{len(target_lons)}...")
 
     # RegularGridInterpolator expects ascending axes
-    # GFS lats are typically descending (90 to -90), so flip
     if lats[0] > lats[-1]:
         lats_asc = lats[::-1]
         u10_asc = u10[::-1, :]
@@ -56,43 +56,72 @@ def main():
     target_lat_mesh, target_lon_mesh = np.meshgrid(target_lats, target_lons, indexing='ij')
     points = np.column_stack([target_lat_mesh.ravel(), target_lon_mesh.ravel()])
 
-    u_fine = interp_u(points)
-    v_fine = interp_v(points)
+    u_fine = interp_u(points).reshape(len(target_lats), len(target_lons))
+    v_fine = interp_v(points).reshape(len(target_lats), len(target_lons))
 
-    print(f"Interpolation done. Building JSON...")
+    # Compute speed grid
+    speed_grid = np.sqrt(u_fine**2 + v_fine**2).astype(np.float32)
 
+    # Lats descending (90 to -90) for tile generator
+    if target_lats[0] < target_lats[-1]:
+        target_lats = target_lats[::-1]
+        speed_grid = speed_grid[::-1, :]
+        u_fine = u_fine[::-1, :]
+        v_fine = v_fine[::-1, :]
+
+    # Convert lons from 0-360 to -180 to 180 for the grid
+    lon_converted = np.where(target_lons <= 180, target_lons, target_lons - 360)
+    sort_idx = np.argsort(lon_converted)
+    lon_converted = lon_converted[sort_idx]
+    speed_grid = speed_grid[:, sort_idx]
+    u_fine = u_fine[:, sort_idx]
+    v_fine = v_fine[:, sort_idx]
+
+    # Save as numpy grid (exact floats, no rounding issues)
+    npz_file = 'data/wind_grid.npz'
+    np.savez(npz_file,
+             lats=target_lats,
+             lons=lon_converted,
+             speed=speed_grid,
+             u=u_fine.astype(np.float32),
+             v=v_fine.astype(np.float32))
+    print(f"\nSaved grid to {npz_file}")
+    print(f"Grid shape: {speed_grid.shape}")
+    print(f"Lat range: {target_lats[0]} to {target_lats[-1]}")
+    print(f"Lon range: {lon_converted[0]} to {lon_converted[-1]}")
+    print(f"Speed range: {speed_grid.min():.2f} to {speed_grid.max():.2f} m/s")
+
+    # Also save JSON for tooltip lookups (this can be lossy, it's just for display)
+    print(f"\nBuilding JSON for tooltip lookups...")
     wind_data = []
-    for i in range(len(points)):
-        u = float(u_fine[i])
-        v = float(v_fine[i])
-        lat = float(points[i, 0])
-        lon = float(points[i, 1])
+    # Subsample for JSON - full grid is too big, use every 8th point
+    step = 8
+    for i in range(0, len(target_lats), step):
+        for j in range(0, len(lon_converted), step):
+            lat = float(target_lats[i])
+            lon = float(lon_converted[j])
+            spd = float(speed_grid[i, j])
+            u = float(u_fine[i, j])
+            v = float(v_fine[i, j])
+            direction = (math.degrees(math.atan2(-u, -v)) + 360) % 360
 
-        speed = math.sqrt(u**2 + v**2)
-        direction = (math.degrees(math.atan2(-u, -v)) + 360) % 360
+            wind_data.append({
+                'lat': round(lat, 2),
+                'lon': round(lon, 2),
+                'u': round(u, 2),
+                'v': round(v, 2),
+                'speed': round(spd, 2),
+                'direction': round(direction, 1)
+            })
 
-        lon_converted = lon if lon <= 180 else lon - 360
-
-        wind_data.append({
-            'lat': lat,
-            'lon': round(lon_converted, 3),
-            'u': round(u, 2),
-            'v': round(v, 2),
-            'speed': round(speed, 2),
-            'direction': round(direction, 1)
-        })
-
-    print(f"\nTotal points: {len(wind_data)}")
-    print(f"Sample point: {wind_data[1000]}")
-
-    # Save to JSON
     output_file = 'data/wind_data.json'
     with open(output_file, 'w') as f:
         json.dump(wind_data, f)
 
-    print(f"\nSaved to {output_file}")
-    print(f"File size: {len(json.dumps(wind_data)) / 1024 / 1024:.2f} MB")
+    print(f"Saved {len(wind_data):,} points to {output_file}")
+    print(f"File size: {os.path.getsize(output_file) / 1024 / 1024:.2f} MB")
 
 
 if __name__ == '__main__':
+    import os
     main()

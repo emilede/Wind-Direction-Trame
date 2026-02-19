@@ -1,33 +1,6 @@
 """
 Wind visualization with pre-rendered tiles.
 Tooltip shows wind speed/direction on hover using Trame state.
-
-TOOLTIP ARCHITECTURE (for thesis documentation):
-=================================================
-The tooltip uses a hybrid client-server approach within the Trame framework:
-
-CLIENT SIDE (Vue mousemove handler on VContainer):
-1. VContainer wraps the Leaflet map and captures mousemove events
-2. On hover, we find a visible Leaflet tile image in the DOM
-3. Parse z/x/y from the tile's URL (e.g., /tiles/3/4/2.png)
-4. Calculate the mouse's fractional position within that tile
-5. Convert tile coords + fraction to lat/lng using Web Mercator math
-6. Send [lat, lng, clientX, clientY] to server via trame state (mouse_data)
-
-SERVER SIDE (Python @state.change handler):
-1. Receives lat/lng from client
-2. Looks up nearest wind data point in a pre-built 0.5° grid
-3. Computes speed (mph), compass direction, and arrow rotation
-4. Updates tooltip state variables (text, position, visibility)
-
-CLIENT SIDE (Vue reactive rendering):
-1. Tooltip div is bound to state variables via v-show, v-text, and dynamic style
-2. Positioned at cursor via fixed positioning with state-driven left/top
-
-Key insight: By reading tile coordinates directly from the DOM (not from
-trame state's `center` which can be stale after dragging), the lat/lng
-calculation is always accurate regardless of map interaction state.
-=================================================
 """
 
 import os
@@ -71,15 +44,12 @@ COMPASS = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
 
 
 def lookup_wind(lat, lon):
-    """Look up wind speed and direction at nearest grid point."""
     lat_key = round(round(lat / LOOKUP_STEP) * LOOKUP_STEP, 1)
-
     while lon > 180:
         lon -= 360
     while lon < -180:
         lon += 360
     lon_key = round(round(lon / LOOKUP_STEP) * LOOKUP_STEP, 1)
-
     return lookup_grid.get((lat_key, lon_key))
 
 
@@ -92,7 +62,6 @@ state.tooltip_arrow_rot = 0
 state.tooltip_x = 0
 state.tooltip_y = 0
 state.mouse_data = None
-state.debug_msg = "Move mouse over map..."
 
 
 @state.change("mouse_data")
@@ -100,11 +69,9 @@ def on_mouse_move(mouse_data, **kwargs):
     if mouse_data is None:
         state.tooltip_visible = False
         return
-
     try:
         lat, lon, cx, cy = mouse_data
         result = lookup_wind(lat, lon)
-
         if result:
             speed, direction = result
             compass = COMPASS[round(direction / 22.5) % 16]
@@ -127,7 +94,6 @@ async def serve_tile(request):
     x = request.match_info['x']
     y = request.match_info['y']
     tile_path = f"./data/tiles/{z}/{x}/{y}.png"
-
     if os.path.exists(tile_path):
         response = web.FileResponse(tile_path)
         response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
@@ -142,7 +108,6 @@ async def serve_border_tile(request):
     x = request.match_info['x']
     y = request.match_info['y']
     tile_path = f"./data/border_tiles/{z}/{x}/{y}.png"
-
     if os.path.exists(tile_path):
         response = web.FileResponse(tile_path)
         response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
@@ -160,8 +125,6 @@ def on_bind(wslink_server):
 
 # ============ UI LAYOUT ============
 
-# JavaScript for coordinate calculation from tile positions
-# This avoids needing the Leaflet map instance entirely
 MOUSEMOVE_JS = """
     if ($event.buttons > 0) {
         tooltip_visible = false;
@@ -198,13 +161,8 @@ MOUSEMOVE_JS = """
             var lat = latRad * 180 / Math.PI;
 
             mouse_data = [lat, lon, $event.clientX, $event.clientY];
-            debug_msg = 'lat: ' + lat.toFixed(2) + ' lon: ' + lon.toFixed(2);
             found = true;
             break;
-        }
-
-        if (!found) {
-            debug_msg = 'No tile under cursor (found ' + tiles.length + ' tiles)';
         }
     }
 """
@@ -224,7 +182,7 @@ with SinglePageLayout(server) as layout:
                 zoom=("zoom", 3),
                 center=("center", [20, 0]),
                 world_copy_jump=True,
-                max_zoom=3,
+                max_zoom=4,
                 min_zoom=3,
                 style="height: 100%; width: 100%;",
             ):
