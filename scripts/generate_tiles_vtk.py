@@ -36,7 +36,7 @@ TILE_SIZE = 256
 RENDER_SCALE = 4
 PADDING = 32
 MIN_ZOOM = 3
-MAX_ZOOM = 3
+MAX_ZOOM = 5
 OUTPUT_DIR = os.path.abspath('data/tiles')
 TERRAIN_CACHE = os.path.abspath('data/terrain_cache')
 
@@ -71,28 +71,44 @@ def fetch_terrain_tile(z, x, y):
 
 
 def create_vtk_lut():
+    """Create VTK lookup table with exact Zoom Earth colors (pixel-sampled)."""
+    # Colors sampled directly from Zoom Earth at each mph value
+    # Format: (t, (R, G, B)) where t = speed_ms / 35
     colors = [
-        (0.000, (15, 35, 55)),
-        (0.029, (18, 45, 65)),
-        (0.057, (20, 60, 80)),
-        (0.086, (25, 80, 105)),
-        (0.129, (35, 110, 135)),
-        (0.171, (40, 145, 130)),
-        (0.214, (45, 165, 100)),
-        (0.257, (60, 180, 65)),
-        (0.300, (110, 195, 50)),
-        (0.343, (170, 210, 45)),
-        (0.386, (220, 220, 50)),
-        (0.429, (245, 200, 45)),
-        (0.486, (245, 160, 40)),
-        (0.543, (235, 115, 40)),
-        (0.600, (215, 80, 40)),
-        (0.657, (185, 55, 45)),
-        (0.714, (155, 40, 55)),
-        (0.786, (125, 30, 65)),
-        (0.857, (95, 25, 60)),
-        (0.929, (70, 20, 50)),
-        (1.000, (50, 15, 40)),
+        # 0 mph (0 m/s)
+        (0.000, (91, 70, 168)),
+        # 5 mph (2.24 m/s)
+        (0.064, (87, 112, 195)),
+        # 10 mph (4.47 m/s)
+        (0.128, (95, 155, 207)),
+        # 15 mph (6.71 m/s)
+        (0.192, (113, 196, 201)),
+        # 20 mph (8.94 m/s)
+        (0.255, (133, 225, 174)),
+        # 25 mph (11.18 m/s)
+        (0.319, (176, 234, 154)),
+        # 30 mph (13.41 m/s)
+        (0.383, (228, 242, 145)),
+        # 35 mph (15.65 m/s)
+        (0.447, (245, 228, 134)),
+        # 40 mph (17.88 m/s)
+        (0.511, (248, 192, 123)),
+        # 45 mph (20.12 m/s)
+        (0.575, (243, 156, 112)),
+        # 50 mph (22.35 m/s)
+        (0.639, (231, 127, 105)),
+        # 55 mph (24.59 m/s)
+        (0.703, (216, 105, 99)),
+        # 60 mph (26.82 m/s)
+        (0.766, (196, 88, 99)),
+        # 65 mph (29.06 m/s)
+        (0.830, (174, 74, 103)),
+        # 70 mph (31.29 m/s)
+        (0.894, (155, 62, 106)),
+        # 75 mph (33.53 m/s)
+        (0.958, (138, 50, 105)),
+        # 80 mph (35.76 m/s)
+        (1.000, (122, 39, 106)),
     ]
 
     lut = vtk.vtkLookupTable()
@@ -215,9 +231,9 @@ class TileRenderer:
         for c in range(3):
             w = wind_cropped[:, :, c] / 255.0
             t = terrain_norm
-            result[:, :, c] = 1 - (1 - t * 0.3) * (1 - w)
+            result[:, :, c] = 1 - (1 - t * 0.1) * (1 - w)
 
-        result = np.clip(result * 255 * 1.1, 0, 255).astype(np.uint8)
+        result = np.clip(result * 255, 0, 255).astype(np.uint8)
         return result
 
 
@@ -229,12 +245,9 @@ def main():
     n_points = len(wind_data)
     log(f"Loaded {n_points:,} points")
 
-    # Extract speed array
     speeds = np.array([p['speed'] for p in wind_data], dtype=np.float32)
 
-    # Figure out grid dimensions from the data
-    # Data is in row-major order: lat varies slowest, lon varies fastest
-    # Count unique lons in first row to get n_lons
+    # Figure out grid dimensions
     first_lat = wind_data[0]['lat']
     n_lons = 0
     for p in wind_data:
@@ -247,21 +260,15 @@ def main():
     assert n_lats * n_lons == n_points, f"Grid not rectangular: {n_lats} x {n_lons} != {n_points}"
     log(f"Grid dimensions: {n_lats} x {n_lons}")
 
-    # Reshape directly - data is already a perfect grid
     speed_grid = speeds.reshape(n_lats, n_lons)
 
-    # Get the actual lat/lon arrays from the data
-    # Lats: one value per row (take every n_lons-th point)
     grid_lats_asc = np.array([wind_data[i * n_lons]['lat'] for i in range(n_lats)])
-    # Lons: first row
     grid_lons_raw = np.array([wind_data[j]['lon'] for j in range(n_lons)])
 
-    log(f"Lats: {grid_lats_asc[0]} to {grid_lats_asc[-1]} (ascending)")
+    log(f"Lats: {grid_lats_asc[0]} to {grid_lats_asc[-1]}")
     log(f"Lons raw: {grid_lons_raw[0]} to {grid_lons_raw[-1]}")
 
-    # Lons from convert.py are: 0, 0.0625, ..., 180, -179.9375, ..., -0.25
-    # We need to rearrange to: -180, -179.9375, ..., 0, ..., 179.9375
-    # Find where negative lons start
+    # Rearrange lons from 0..180,-179..-0.25 to -180..180
     neg_start = None
     for i in range(1, len(grid_lons_raw)):
         if grid_lons_raw[i] < grid_lons_raw[i - 1]:
@@ -269,26 +276,20 @@ def main():
             break
 
     if neg_start is not None:
-        log(f"Lon wraparound at index {neg_start}: {grid_lons_raw[neg_start-1]:.4f} -> {grid_lons_raw[neg_start]:.4f}")
-        # Rearrange: negative lons first, then positive
+        log(f"Lon wraparound at index {neg_start}")
         grid_lons = np.concatenate([grid_lons_raw[neg_start:], grid_lons_raw[:neg_start]])
         speed_grid = np.concatenate([speed_grid[:, neg_start:], speed_grid[:, :neg_start]], axis=1)
     else:
         grid_lons = grid_lons_raw
 
-    # Flip lats to descending (90 to -90) as tile renderer expects
+    # Flip lats to descending (90 to -90)
     grid_lats = grid_lats_asc[::-1]
     speed_grid = speed_grid[::-1, :]
 
     log(f"Final grid: {speed_grid.shape}")
-    log(f"Lats: {grid_lats[0]:.4f} to {grid_lats[-1]:.4f} (descending)")
-    log(f"Lons: {grid_lons[0]:.4f} to {grid_lons[-1]:.4f} (ascending)")
+    log(f"Lats: {grid_lats[0]:.4f} to {grid_lats[-1]:.4f}")
+    log(f"Lons: {grid_lons[0]:.4f} to {grid_lons[-1]:.4f}")
     log(f"Speed range: {speed_grid.min():.2f} - {speed_grid.max():.2f} m/s")
-
-    # DIAGNOSTIC: save speed grid as image
-    diag = (speed_grid / speed_grid.max() * 255).astype(np.uint8)
-    Image.fromarray(diag).save('data/speed_grid_debug.png')
-    log("Saved diagnostic: data/speed_grid_debug.png")
 
     # Extend grid for antimeridian wrapping
     wrap_cols = 60
