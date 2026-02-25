@@ -1,12 +1,18 @@
 """
-Wind visualization with pre-rendered tiles and animated wind particles.
+Wind visualization with pre-rendered tiles and VTK-rendered wind particles.
 """
 
 import os
 import json
 import time
 import math
+import asyncio
+import io
+import base64
 import numpy as np
+import vtk
+from vtk.util.numpy_support import vtk_to_numpy
+from PIL import Image
 from aiohttp import web
 from trame.app import get_server
 from trame.ui.vuetify3 import SinglePageLayout
@@ -18,64 +24,54 @@ server = get_server(client_type="vue3")
 state = server.state
 state.trame__title = "Wind Speed"
 
-# ============ WIND DATA LOOKUP + WIND FIELD ============
+# ============ WIND DATA LOOKUP ============
 
 print("Loading wind data...")
 with open('data/wind_data.json') as f:
     wind_data = json.load(f)
 
-# Tooltip lookup grid (0.5° resolution)
+# Tooltip lookup grid (0.5deg resolution)
 LOOKUP_STEP = 0.5
 lookup_grid = {}
 
-# Wind field for particle animation (1° resolution)
-FIELD_STEP = 1.0
-field_u = {}
-field_v = {}
-
 for p in wind_data:
-    # Tooltip
     lat_key = round(round(p['lat'] / LOOKUP_STEP) * LOOKUP_STEP, 1)
     lon_key = round(round(p['lon'] / LOOKUP_STEP) * LOOKUP_STEP, 1)
     key = (lat_key, lon_key)
     if key not in lookup_grid:
         lookup_grid[key] = (round(p['speed'], 1), round(p['direction']))
 
-    # Wind field
-    flat = float(int(round(p['lat'] / FIELD_STEP))) * FIELD_STEP
-    flon = float(int(round(p['lon'] / FIELD_STEP))) * FIELD_STEP
-    fkey = (flat, flon)
-    if fkey not in field_u:
-        field_u[fkey] = round(p['u'], 2)
-        field_v[fkey] = round(p['v'], 2)
-
+del wind_data
 print(f"Tooltip grid: {len(lookup_grid)} points")
-print(f"Wind field grid: {len(field_u)} points")
 
-# Build wind field JSON (served to client for particle animation)
-u_arr = []
-v_arr = []
-for lat_i in range(90, -91, -1):
-    for lon_i in range(-180, 181, 1):
-        key = (float(lat_i), float(lon_i))
-        u_arr.append(field_u.get(key, 0.0))
-        v_arr.append(field_v.get(key, 0.0))
+# ============ WIND FIELD FOR PARTICLES (from NPZ) ============
 
-wind_field_json = json.dumps({
-    'lat_min': -90, 'lat_max': 90, 'lat_step': 1.0,
-    'lon_min': -180, 'lon_max': 180, 'lon_step': 1.0,
-    'n_lats': 181, 'n_lons': 361,
-    'u': u_arr, 'v': v_arr
-})
-print(f"Wind field JSON: {len(wind_field_json) / 1024:.0f} KB")
+print("Loading wind grid for particles...")
+_npz = np.load('data/wind_grid.npz')
+_full_lats = _npz['lats']  # (2881,) 90 -> -90, step 0.0625
+_full_lons = _npz['lons']  # (5760,) -180 -> 179.9375, step 0.0625
+_full_u = _npz['u']        # (2881, 5760)
+_full_v = _npz['v']        # (2881, 5760)
 
-del wind_data, field_u, field_v, u_arr, v_arr
+# Subsample every 16th point (0.0625 * 16 = 1.0 degree)
+WIND_STEP = 16
+WIND_LATS = _full_lats[::WIND_STEP]
+WIND_LONS = _full_lons[::WIND_STEP]
+WIND_U = _full_u[::WIND_STEP, ::WIND_STEP].astype(np.float64)
+WIND_V = _full_v[::WIND_STEP, ::WIND_STEP].astype(np.float64)
+WIND_LAT_MAX = float(WIND_LATS[0])     # 90
+WIND_LON_MIN = float(WIND_LONS[0])     # -180
+WIND_LAT_STEP = abs(float(WIND_LATS[1] - WIND_LATS[0]))
+WIND_LON_STEP = abs(float(WIND_LONS[1] - WIND_LONS[0]))
+
+del _npz, _full_lats, _full_lons, _full_u, _full_v
+print(f"Wind grid: {WIND_U.shape} at {WIND_LAT_STEP:.2f}deg resolution")
 
 COMPASS = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
            'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
 
 
-def lookup_wind(lat, lon):
+def lookup_wind_tooltip(lat, lon):
     lat_key = round(round(lat / LOOKUP_STEP) * LOOKUP_STEP, 1)
     while lon > 180:
         lon -= 360
@@ -83,6 +79,255 @@ def lookup_wind(lat, lon):
         lon += 360
     lon_key = round(round(lon / LOOKUP_STEP) * LOOKUP_STEP, 1)
     return lookup_grid.get((lat_key, lon_key))
+
+
+# ============ VTK PARTICLE RENDERER ============
+
+class ParticleRenderer:
+    """Off-screen VTK renderer for particle line segments."""
+
+    def __init__(self, width, height):
+        self.width = width
+        self.height = height
+
+        self.render_window = vtk.vtkRenderWindow()
+        self.render_window.SetOffScreenRendering(1)
+        self.render_window.SetSize(width, height)
+        self.render_window.SetAlphaBitPlanes(1)
+        self.render_window.SetMultiSamples(0)
+
+        self.renderer = vtk.vtkRenderer()
+        self.renderer.SetBackground(0, 0, 0)
+        self.renderer.SetBackgroundAlpha(0.0)
+        self.render_window.AddRenderer(self.renderer)
+
+        self.points = vtk.vtkPoints()
+        self.lines = vtk.vtkCellArray()
+        self.polydata = vtk.vtkPolyData()
+        self.polydata.SetPoints(self.points)
+        self.polydata.SetLines(self.lines)
+
+        self.mapper = vtk.vtkPolyDataMapper()
+        self.mapper.SetInputData(self.polydata)
+
+        self.actor = vtk.vtkActor()
+        self.actor.SetMapper(self.mapper)
+        self.actor.GetProperty().SetColor(1.0, 1.0, 1.0)
+        self.actor.GetProperty().SetOpacity(0.6)
+        self.actor.GetProperty().SetLineWidth(2.0)
+        self.renderer.AddActor(self.actor)
+
+        self._setup_camera()
+
+        self.w2i = vtk.vtkWindowToImageFilter()
+        self.w2i.SetInput(self.render_window)
+        self.w2i.SetInputBufferTypeToRGBA()
+        self.w2i.ReadFrontBufferOff()
+
+    def _setup_camera(self):
+        camera = self.renderer.GetActiveCamera()
+        camera.SetParallelProjection(True)
+        camera.SetPosition(self.width / 2, self.height / 2, 1)
+        camera.SetFocalPoint(self.width / 2, self.height / 2, 0)
+        camera.SetParallelScale(self.height / 2)
+        self.renderer.ResetCameraClippingRange()
+
+    def resize(self, width, height):
+        self.width = width
+        self.height = height
+        self.render_window.SetSize(width, height)
+        self._setup_camera()
+
+    def render_frame(self, segments):
+        """
+        Render line segments and return RGBA numpy array.
+        segments: Nx4 array of (x0, y0, x1, y1) in pixel coords.
+        Returns: (height, width, 4) uint8 array.
+        """
+        self.points.Reset()
+        self.lines.Reset()
+
+        n = len(segments)
+        if n == 0:
+            return np.zeros((self.height, self.width, 4), dtype=np.uint8)
+
+        self.points.SetNumberOfPoints(n * 2)
+        for i in range(n):
+            # VTK Y is bottom-up, so flip Y coordinates
+            self.points.SetPoint(i * 2, segments[i, 0], self.height - segments[i, 1], 0)
+            self.points.SetPoint(i * 2 + 1, segments[i, 2], self.height - segments[i, 3], 0)
+
+        for i in range(n):
+            self.lines.InsertNextCell(2)
+            self.lines.InsertCellPoint(i * 2)
+            self.lines.InsertCellPoint(i * 2 + 1)
+
+        self.polydata.Modified()
+        self.render_window.Render()
+        self.w2i.Modified()
+        self.w2i.Update()
+
+        output = self.w2i.GetOutput()
+        dims = output.GetDimensions()
+        rgba = vtk_to_numpy(output.GetPointData().GetScalars())
+        rgba = rgba.reshape(dims[1], dims[0], -1)
+        return np.flipud(rgba[:, :, :4].copy())
+
+
+# ============ PARTICLE SIMULATION ============
+
+class ParticleSimulation:
+    """NumPy-vectorized particle advection through wind field."""
+
+    NUM_PARTICLES = 1500
+    MAX_AGE = 80
+    SPEED_MAX_PX = 1.5
+    MAX_WIND = 35.0
+
+    def __init__(self):
+        self.x = np.zeros(self.NUM_PARTICLES)
+        self.y = np.zeros(self.NUM_PARTICLES)
+        self.age = np.zeros(self.NUM_PARTICLES, dtype=np.int32)
+        self.max_age = np.zeros(self.NUM_PARTICLES, dtype=np.int32)
+        self.width = 1200
+        self.height = 800
+        self.zoom = 3
+        self.center_lat = 20.0
+        self.center_lon = 0.0
+        self._initialized = False
+
+    def init_particles(self):
+        self.x = np.random.rand(self.NUM_PARTICLES) * self.width
+        self.y = np.random.rand(self.NUM_PARTICLES) * self.height
+        self.age = np.random.randint(0, self.MAX_AGE, self.NUM_PARTICLES)
+        self.max_age = self.MAX_AGE + np.random.randint(0, 20, self.NUM_PARTICLES)
+        self._initialized = True
+
+    def update_viewport(self, zoom, center_lat, center_lon, width, height):
+        self.zoom = zoom
+        self.center_lat = center_lat
+        self.center_lon = center_lon
+        self.width = width
+        self.height = height
+        self.init_particles()
+
+    def pixel_to_latlon(self, px, py):
+        """Convert screen pixel coords to lat/lon (vectorized, Web Mercator)."""
+        total_pixels = 256.0 * (2 ** self.zoom)
+
+        # Center of map in world pixel coordinates
+        cx_world = (self.center_lon + 180.0) / 360.0 * total_pixels
+        lat_rad = math.radians(self.center_lat)
+        cy_world = (1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0 * total_pixels
+
+        # Screen pixel -> world pixel
+        wx = cx_world + (px - self.width / 2.0)
+        wy = cy_world + (py - self.height / 2.0)
+
+        # World pixel -> lat/lon (inverse Web Mercator)
+        lon = wx / total_pixels * 360.0 - 180.0
+        merc_y = math.pi * (1.0 - 2.0 * wy / total_pixels)
+        lat = np.degrees(np.arctan(np.sinh(merc_y)))
+
+        return lat, lon
+
+    def lookup_wind_field(self, lats, lons):
+        """Bilinear interpolation of wind vectors (vectorized)."""
+        lons = np.where(lons > 180, lons - 360, lons)
+        lons = np.where(lons < -180, lons + 360, lons)
+
+        # Grid indices (lats descending: index 0 = WIND_LAT_MAX)
+        li = (WIND_LAT_MAX - lats) / WIND_LAT_STEP
+        lj = (lons - WIND_LON_MIN) / WIND_LON_STEP
+
+        i0 = np.clip(np.floor(li).astype(int), 0, WIND_U.shape[0] - 2)
+        j0 = np.clip(np.floor(lj).astype(int), 0, WIND_U.shape[1] - 2)
+
+        fi = np.clip(li - i0, 0.0, 1.0)
+        fj = np.clip(lj - j0, 0.0, 1.0)
+
+        u = (WIND_U[i0, j0] * (1 - fi) * (1 - fj) +
+             WIND_U[i0 + 1, j0] * fi * (1 - fj) +
+             WIND_U[i0, j0 + 1] * (1 - fi) * fj +
+             WIND_U[i0 + 1, j0 + 1] * fi * fj)
+
+        v = (WIND_V[i0, j0] * (1 - fi) * (1 - fj) +
+             WIND_V[i0 + 1, j0] * fi * (1 - fj) +
+             WIND_V[i0, j0 + 1] * (1 - fi) * fj +
+             WIND_V[i0 + 1, j0 + 1] * fi * fj)
+
+        return u, v
+
+    def step(self):
+        """Advance particles one step. Returns Nx4 segment array."""
+        if not self._initialized:
+            return np.empty((0, 4))
+
+        lats, lons = self.pixel_to_latlon(self.x, self.y)
+        u, v = self.lookup_wind_field(lats, lons)
+
+        speed_scale = self.SPEED_MAX_PX / self.MAX_WIND * (2 ** (self.zoom - 3))
+        dx = u * speed_scale
+        dy = -v * speed_scale  # Screen Y is inverted
+
+        old_x = self.x.copy()
+        old_y = self.y.copy()
+        self.x += dx
+        self.y += dy
+        self.age += 1
+
+        # Build segments for particles that moved
+        moved = (np.abs(dx) > 0.01) | (np.abs(dy) > 0.01)
+        if moved.any():
+            segments = np.column_stack([
+                old_x[moved], old_y[moved],
+                self.x[moved], self.y[moved]
+            ])
+        else:
+            segments = np.empty((0, 4))
+
+        # Respawn dead or out-of-bounds particles
+        dead = ((self.age > self.max_age) |
+                (self.x < -10) | (self.x > self.width + 10) |
+                (self.y < -10) | (self.y > self.height + 10))
+        n_dead = dead.sum()
+        if n_dead > 0:
+            self.x[dead] = np.random.rand(n_dead) * self.width
+            self.y[dead] = np.random.rand(n_dead) * self.height
+            self.age[dead] = np.random.randint(0, self.MAX_AGE, n_dead)
+            self.max_age[dead] = self.MAX_AGE + np.random.randint(0, 20, n_dead)
+
+        return segments
+
+
+# ============ TRAIL COMPOSITING ============
+
+class TrailCompositor:
+    """Maintains a fading trail buffer and encodes frames as base64 PNG."""
+
+    def __init__(self, width, height, fade_alpha=0.95):
+        self.fade_alpha = fade_alpha
+        self.trail = np.zeros((height, width, 4), dtype=np.float32)
+
+    def composite(self, new_frame_rgba):
+        """Fade trails, add new segments, return base64 PNG data URI."""
+        self.trail[:, :, 3] *= self.fade_alpha
+
+        mask = new_frame_rgba[:, :, 3] > 0
+        self.trail[mask] = new_frame_rgba[mask].astype(np.float32)
+
+        frame_uint8 = np.clip(self.trail, 0, 255).astype(np.uint8)
+        img = Image.fromarray(frame_uint8, 'RGBA')
+        buf = io.BytesIO()
+        img.save(buf, format='PNG', compress_level=1)
+        b64 = base64.b64encode(buf.getvalue()).decode('ascii')
+        return f"data:image/png;base64,{b64}"
+
+    def clear(self):
+        self.trail[:] = 0
+
+    def resize(self, width, height):
+        self.trail = np.zeros((height, width, 4), dtype=np.float32)
 
 
 # ============ TRAME STATE ============
@@ -95,6 +340,14 @@ state.tooltip_x = 0
 state.tooltip_y = 0
 state.mouse_data = None
 
+state.particle_frame = ""
+state.particle_active = True
+state.map_viewport = None
+
+simulation = ParticleSimulation()
+particle_renderer = ParticleRenderer(1200, 800)
+compositor = TrailCompositor(1200, 800)
+
 
 @state.change("mouse_data")
 def on_mouse_move(mouse_data, **kwargs):
@@ -103,7 +356,7 @@ def on_mouse_move(mouse_data, **kwargs):
         return
     try:
         lat, lon, cx, cy = mouse_data
-        result = lookup_wind(lat, lon)
+        result = lookup_wind_tooltip(lat, lon)
         if result:
             speed, direction = result
             compass = COMPASS[round(direction / 22.5) % 16]
@@ -117,6 +370,120 @@ def on_mouse_move(mouse_data, **kwargs):
             state.tooltip_visible = False
     except Exception:
         state.tooltip_visible = False
+
+
+@state.change("map_viewport")
+def on_viewport_change(map_viewport, **kwargs):
+    """Handle initial viewport dimensions from client JS."""
+    if map_viewport is None:
+        return
+    try:
+        zoom = int(map_viewport['zoom'])
+        center = map_viewport['center']
+        width = int(map_viewport['width'])
+        height = int(map_viewport['height'])
+        if width < 10 or height < 10:
+            return
+        simulation.update_viewport(zoom, center[0], center[1], width, height)
+        particle_renderer.resize(width, height)
+        compositor.resize(width, height)
+    except Exception:
+        pass
+
+
+_viewport_update_task = None
+_map_move_paused = False
+
+
+@state.change("zoom", "center")
+def on_map_move(zoom, center, **kwargs):
+    """Debounced handler for map pan/zoom — pauses particles, resyncs after 400ms."""
+    global _viewport_update_task, _map_move_paused
+    if not simulation._initialized:
+        return
+
+    # Pause animation (only set state once to avoid flooding)
+    if not _map_move_paused:
+        _map_move_paused = True
+        state.particle_active = False
+
+    # Cancel any pending viewport update
+    if _viewport_update_task is not None:
+        _viewport_update_task.cancel()
+
+    # Capture current values for the closure
+    _zoom = int(zoom)
+    _center = list(center)
+
+    async def delayed_update():
+        global _map_move_paused
+        await asyncio.sleep(0.4)
+        simulation.update_viewport(
+            _zoom, _center[0], _center[1],
+            simulation.width, simulation.height,
+        )
+        compositor.clear()
+        _map_move_paused = False
+        with state:
+            state.particle_active = True
+
+    _viewport_update_task = asyncio.ensure_future(delayed_update())
+
+
+# ============ ANIMATION LOOP ============
+
+TARGET_FPS = 20
+FRAME_INTERVAL = 1.0 / TARGET_FPS
+
+
+async def animation_loop():
+    """Server-side particle animation driven by VTK rendering.
+
+    Note: VTK's Cocoa render window on macOS requires the main thread,
+    so we cannot offload rendering to a thread pool. Instead we yield
+    to the event loop between frames with asyncio.sleep.
+    """
+    while not simulation._initialized:
+        await asyncio.sleep(0.5)
+
+    print("Particle animation started")
+    frame_count = 0
+    t_start = time.time()
+
+    while True:
+        if not state.particle_active:
+            await asyncio.sleep(0.1)
+            continue
+
+        t0 = time.time()
+
+        segments = simulation.step()
+        new_frame = particle_renderer.render_frame(segments)
+        frame_uri = compositor.composite(new_frame)
+
+        with state:
+            state.particle_frame = frame_uri
+
+        frame_count += 1
+        if frame_count % 100 == 0:
+            elapsed_total = time.time() - t_start
+            avg_fps = frame_count / elapsed_total
+            frame_ms = (time.time() - t0) * 1000
+            print(f"Particles: {frame_count} frames, avg {avg_fps:.1f} FPS, last frame {frame_ms:.0f}ms")
+
+        elapsed = time.time() - t0
+        sleep_time = max(0.01, FRAME_INTERVAL - elapsed)
+        await asyncio.sleep(sleep_time)
+
+
+@server.controller.add("on_server_ready")
+def start_animation(**kwargs):
+    # Start with default viewport so animation begins immediately
+    # (will be updated when client sends actual viewport dimensions)
+    if not simulation._initialized:
+        simulation.update_viewport(3, 20.0, 0.0, 1200, 800)
+        print("Initialized with default viewport (1200x800, zoom 3)")
+    asyncio.ensure_future(animation_loop())
 
 
 # ============ TILE SERVING ============
@@ -145,282 +512,26 @@ async def serve_border_tile(request):
     return web.Response(status=404)
 
 
-async def serve_wind_field(request):
-    return web.Response(
-        text=wind_field_json,
-        content_type='application/json',
-        headers={'Cache-Control': 'max-age=3600'}
-    )
-
-
-async def serve_particles_js(request):
-    return web.Response(
-        text=PARTICLES_JS,
-        content_type='application/javascript'
-    )
-
-
 @server.controller.add("on_server_bind")
 def on_bind(wslink_server):
     wslink_server.app.router.add_get("/tiles/{z}/{x}/{y}.png", serve_tile)
     wslink_server.app.router.add_get("/borders/{z}/{x}/{y}.png", serve_border_tile)
-    wslink_server.app.router.add_get("/wind_field.json", serve_wind_field)
-    wslink_server.app.router.add_get("/particles.js", serve_particles_js)
-
-
-# ============ PARTICLE ANIMATION JS ============
-
-PARTICLES_JS = """
-(function() {
-    'use strict';
-
-    // === CONFIG ===
-    var NUM_PARTICLES = 1500;
-    var MAX_AGE = 80;
-    var FADE_ALPHA = 0.95;
-    var LINE_WIDTH = 3.0;
-    var LINE_ALPHA = 0.6;
-    var SPEED_MAX_PX = 1.5;
-    var MAX_WIND = 35;
-
-    // === STATE ===
-    var canvas, ctx, trailCanvas, trailCtx;
-    var particles = [];
-    var windField = null;
-    var mapState = null;
-    var animating = false;
-    var moveTimer = null;
-    var animFrame = null;
-    var container = null;
-
-    // === INIT ===
-    function init() {
-        container = document.querySelector('.leaflet-container');
-        if (!container) { setTimeout(init, 500); return; }
-
-        fetch('/wind_field.json')
-            .then(function(r) { return r.json(); })
-            .then(function(data) {
-                windField = data;
-                createCanvas();
-                attachListeners();
-                startAnimation();
-            });
-    }
-
-    function createCanvas() {
-        var dpr = window.devicePixelRatio || 1;
-        var w = container.clientWidth;
-        var h = container.clientHeight;
-
-        canvas = document.createElement('canvas');
-        canvas.id = 'wind-particles';
-        canvas.style.cssText = 'position:absolute;top:0;left:0;pointer-events:none;z-index:450;';
-        canvas.style.width = w + 'px';
-        canvas.style.height = h + 'px';
-        canvas.width = w * dpr;
-        canvas.height = h * dpr;
-        container.appendChild(canvas);
-        ctx = canvas.getContext('2d');
-        ctx.scale(dpr, dpr);
-
-        trailCanvas = document.createElement('canvas');
-        trailCanvas.width = w * dpr;
-        trailCanvas.height = h * dpr;
-        trailCtx = trailCanvas.getContext('2d');
-        trailCtx.scale(dpr, dpr);
-    }
-
-    function resizeCanvas() {
-        if (!canvas || !container) return;
-        var dpr = window.devicePixelRatio || 1;
-        var w = container.clientWidth;
-        var h = container.clientHeight;
-        canvas.style.width = w + 'px';
-        canvas.style.height = h + 'px';
-        canvas.width = w * dpr;
-        canvas.height = h * dpr;
-        ctx.scale(dpr, dpr);
-        trailCanvas.width = w * dpr;
-        trailCanvas.height = h * dpr;
-        trailCtx.scale(dpr, dpr);
-    }
-
-    // === LISTENERS ===
-    function attachListeners() {
-        container.addEventListener('mousedown', onMoveStart, true);
-        container.addEventListener('touchstart', onMoveStart, true);
-        container.addEventListener('wheel', function() {
-            onMoveStart();
-            clearTimeout(moveTimer);
-            moveTimer = setTimeout(onMoveEnd, 600);
-        }, true);
-        document.addEventListener('mouseup', onMoveEnd, true);
-        document.addEventListener('touchend', onMoveEnd, true);
-        window.addEventListener('resize', function() {
-            resizeCanvas();
-            onMoveStart();
-            clearTimeout(moveTimer);
-            moveTimer = setTimeout(onMoveEnd, 500);
-        });
-    }
-
-    function onMoveStart() {
-        animating = false;
-        if (animFrame) { cancelAnimationFrame(animFrame); animFrame = null; }
-        if (ctx && container) {
-            var w = container.clientWidth;
-            var h = container.clientHeight;
-            ctx.clearRect(0, 0, w, h);
-            trailCtx.clearRect(0, 0, w, h);
-        }
-    }
-
-    function onMoveEnd() {
-        clearTimeout(moveTimer);
-        moveTimer = setTimeout(function() {
-            startAnimation();
-        }, 400);
-    }
-
-    // === MAP PROJECTION ===
-    function updateMapState() {
-        var tiles = container.querySelectorAll('.leaflet-tile');
-        var cr = container.getBoundingClientRect();
-        for (var i = 0; i < tiles.length; i++) {
-            var src = tiles[i].src || '';
-            var m = src.match(/\\/tiles\\/(\\d+)\\/(\\d+)\\/(\\d+)\\.png/);
-            if (!m) continue;
-            var rect = tiles[i].getBoundingClientRect();
-            if (rect.width < 10) continue;
-            mapState = {
-                n: Math.pow(2, parseInt(m[1])),
-                zoom: parseInt(m[1]),
-                tw: rect.width,
-                rtx: parseInt(m[2]),
-                rty: parseInt(m[3]),
-                rpx: rect.left - cr.left,
-                rpy: rect.top - cr.top
-            };
-            return true;
-        }
-        return false;
-    }
-
-    function pixelToLatLon(px, py) {
-        var s = mapState;
-        var tx = s.rtx + (px - s.rpx) / s.tw;
-        var ty = s.rty + (py - s.rpy) / s.tw;
-        var lon = tx / s.n * 360 - 180;
-        var lat = Math.atan(Math.sinh(Math.PI * (1 - 2 * ty / s.n))) * 180 / Math.PI;
-        return [lat, lon];
-    }
-
-    // === WIND LOOKUP ===
-    function getWind(lat, lon) {
-        if (!windField) return [0, 0];
-        while (lon > 180) lon -= 360;
-        while (lon < -180) lon += 360;
-
-        var li = (windField.lat_max - lat) / windField.lat_step;
-        var lj = (lon - windField.lon_min) / windField.lon_step;
-        var i0 = Math.floor(li), j0 = Math.floor(lj);
-        var i1 = i0 + 1, j1 = j0 + 1;
-
-        if (i0 < 0 || i1 >= windField.n_lats || j0 < 0 || j1 >= windField.n_lons)
-            return [0, 0];
-
-        var fi = li - i0, fj = lj - j0;
-        var nl = windField.n_lons;
-        var u = windField.u, v = windField.v;
-
-        var ui = u[i0*nl+j0]*(1-fi)*(1-fj) + u[i0*nl+j1]*(1-fi)*fj
-               + u[i1*nl+j0]*fi*(1-fj) + u[i1*nl+j1]*fi*fj;
-        var vi = v[i0*nl+j0]*(1-fi)*(1-fj) + v[i0*nl+j1]*(1-fi)*fj
-               + v[i1*nl+j0]*fi*(1-fj) + v[i1*nl+j1]*fi*fj;
-
-        return [ui, vi];
-    }
-
-    // === PARTICLES ===
-    function spawnParticle() {
-        var w = container.clientWidth, h = container.clientHeight;
-        return {
-            x: Math.random() * w,
-            y: Math.random() * h,
-            age: Math.floor(Math.random() * MAX_AGE),
-            maxAge: MAX_AGE + Math.floor(Math.random() * 20)
-        };
-    }
-
-    function startAnimation() {
-        if (!updateMapState()) {
-            setTimeout(startAnimation, 500);
-            return;
-        }
-        particles = [];
-        for (var i = 0; i < NUM_PARTICLES; i++) particles.push(spawnParticle());
-
-        var w = container.clientWidth, h = container.clientHeight;
-        ctx.clearRect(0, 0, w, h);
-        trailCtx.clearRect(0, 0, w, h);
-        animating = true;
-        animate();
-    }
-
-    function animate() {
-        if (!animating) return;
-
-        var w = container.clientWidth, h = container.clientHeight;
-        var speedScale = SPEED_MAX_PX / MAX_WIND * Math.pow(2, mapState.zoom - 3);
-
-        // Fade trails
-        trailCtx.clearRect(0, 0, w, h);
-        trailCtx.drawImage(canvas, 0, 0, w, h);
-        ctx.clearRect(0, 0, w, h);
-        ctx.globalAlpha = FADE_ALPHA;
-        ctx.drawImage(trailCanvas, 0, 0, w, h);
-        ctx.globalAlpha = 1.0;
-
-        // Draw new segments
-        ctx.beginPath();
-        ctx.strokeStyle = 'rgba(255,255,255,' + LINE_ALPHA + ')';
-        ctx.lineWidth = LINE_WIDTH;
-
-        for (var i = 0; i < particles.length; i++) {
-            var p = particles[i];
-            var ll = pixelToLatLon(p.x, p.y);
-            if (!ll) { particles[i] = spawnParticle(); continue; }
-
-            var wind = getWind(ll[0], ll[1]);
-            var dx = wind[0] * speedScale;
-            var dy = -wind[1] * speedScale;
-
-            if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) { p.age++; }
-            else {
-                var nx = p.x + dx, ny = p.y + dy;
-                ctx.moveTo(p.x, p.y);
-                ctx.lineTo(nx, ny);
-                p.x = nx;
-                p.y = ny;
-            }
-
-            p.age++;
-            if (p.age > p.maxAge || p.x < -10 || p.x > w+10 || p.y < -10 || p.y > h+10) {
-                particles[i] = spawnParticle();
-            }
-        }
-        ctx.stroke();
-        animFrame = requestAnimationFrame(animate);
-    }
-
-    // Start
-    init();
-})();
-"""
 
 
 # ============ UI LAYOUT ============
+
+# Send viewport info on first mouse enter
+INIT_VIEWPORT_JS = (
+    "if(typeof window!=='undefined'&&!window._vpInit){"
+    "window._vpInit=true;"
+    "var ct=$event.currentTarget;"
+    "window.setTimeout(function(){"
+    "var el=ct?ct.querySelector('.leaflet-container'):null;"
+    "if(el){var r=el.getBoundingClientRect();"
+    "map_viewport={zoom:zoom,center:center,"
+    "width:Math.round(r.width),height:Math.round(r.height)};}"
+    "},1500);}"
+)
 
 MOUSEMOVE_JS = """
     if ($event.buttons > 0) {
@@ -475,14 +586,7 @@ with SinglePageLayout(server) as layout:
             fluid=True,
             classes="fill-height pa-0",
             style="position: relative;",
-            mouseenter=(
-                "if(!window._pLoaded){"
-                "window._pLoaded=true;"
-                "window.setTimeout(function(){"
-                "var s=window.document.createElement('script');"
-                "s.src='/particles.js';"
-                "window.document.head.appendChild(s);},1000);}"
-            ),
+            mouseenter=INIT_VIEWPORT_JS,
             mousemove=MOUSEMOVE_JS,
             mouseleave="mouse_data = null; tooltip_visible = false",
         ):
@@ -506,6 +610,17 @@ with SinglePageLayout(server) as layout:
                     minZoom=3,
                     maxZoom=5,
                 )
+
+            # VTK-rendered particle overlay
+            html_widgets.Img(
+                src=("particle_frame",),
+                style=(
+                    "position:absolute; top:0; left:0; "
+                    "width:100%; height:100%; "
+                    "pointer-events:none; z-index:450;"
+                ),
+                v_show=("particle_frame",),
+            )
 
         # Tooltip
         html_widgets.Div(

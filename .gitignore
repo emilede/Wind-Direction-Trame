@@ -213,3 +213,4 @@ scripts/create_png.txt
 gfs_wind.grib2
 gfs_wind.grib2.5b7b6.idx
 scripts/json_to_npz.py
+CLAUDE.md
