@@ -344,9 +344,12 @@ state.particle_frame = ""
 state.particle_active = True
 state.map_viewport = None
 
+# Render at half resolution — browser CSS scales up the <img>
+RENDER_SCALE = 0.5
+
 simulation = ParticleSimulation()
-particle_renderer = ParticleRenderer(1200, 800)
-compositor = TrailCompositor(1200, 800)
+particle_renderer = ParticleRenderer(int(1200 * RENDER_SCALE), int(800 * RENDER_SCALE))
+compositor = TrailCompositor(int(1200 * RENDER_SCALE), int(800 * RENDER_SCALE))
 
 
 @state.change("mouse_data")
@@ -384,9 +387,12 @@ def on_viewport_change(map_viewport, **kwargs):
         height = int(map_viewport['height'])
         if width < 10 or height < 10:
             return
+        # Simulation works in full viewport coords; renderer at reduced resolution
         simulation.update_viewport(zoom, center[0], center[1], width, height)
-        particle_renderer.resize(width, height)
-        compositor.resize(width, height)
+        rw = int(width * RENDER_SCALE)
+        rh = int(height * RENDER_SCALE)
+        particle_renderer.resize(rw, rh)
+        compositor.resize(rw, rh)
     except Exception:
         pass
 
@@ -402,10 +408,13 @@ def on_map_move(zoom, center, **kwargs):
     if not simulation._initialized:
         return
 
-    # Pause animation (only set state once to avoid flooding)
+    # Pause animation and clear the visible frame so particles
+    # don't stay "glued" to the old map position
     if not _map_move_paused:
         _map_move_paused = True
         state.particle_active = False
+        state.particle_frame = ""
+        compositor.clear()
 
     # Cancel any pending viewport update
     if _viewport_update_task is not None:
@@ -432,7 +441,7 @@ def on_map_move(zoom, center, **kwargs):
 
 # ============ ANIMATION LOOP ============
 
-TARGET_FPS = 20
+TARGET_FPS = 10
 FRAME_INTERVAL = 1.0 / TARGET_FPS
 
 
@@ -458,8 +467,18 @@ async def animation_loop():
         t0 = time.time()
 
         segments = simulation.step()
+        # Scale segments from full viewport coords to render resolution
+        if len(segments) > 0:
+            segments = segments * RENDER_SCALE
         new_frame = particle_renderer.render_frame(segments)
         frame_uri = compositor.composite(new_frame)
+
+        # Yield so pending state changes (map move) can process
+        await asyncio.sleep(0)
+
+        # Don't push stale frame if animation was paused during render
+        if not state.particle_active:
+            continue
 
         with state:
             state.particle_frame = frame_uri
@@ -482,6 +501,8 @@ def start_animation(**kwargs):
     # (will be updated when client sends actual viewport dimensions)
     if not simulation._initialized:
         simulation.update_viewport(3, 20.0, 0.0, 1200, 800)
+        particle_renderer.resize(int(1200 * RENDER_SCALE), int(800 * RENDER_SCALE))
+        compositor.resize(int(1200 * RENDER_SCALE), int(800 * RENDER_SCALE))
         print("Initialized with default viewport (1200x800, zoom 3)")
     asyncio.ensure_future(animation_loop())
 
@@ -536,6 +557,8 @@ INIT_VIEWPORT_JS = (
 MOUSEMOVE_JS = """
     if ($event.buttons > 0) {
         tooltip_visible = false;
+        particle_frame = '';
+        particle_active = false;
         return;
     }
     if (!window._ttThrottle || Date.now() - window._ttThrottle > 60) {
@@ -579,6 +602,14 @@ with SinglePageLayout(server) as layout:
             .leaflet-container {
                 background: #1a1128 !important;
             }
+            .particle-overlay {
+                transition: visibility 0s 0.5s;
+            }
+            .v-container:has(.leaflet-dragging) > .particle-overlay,
+            .v-container:has(.leaflet-zoom-anim) > .particle-overlay {
+                visibility: hidden !important;
+                transition-delay: 0s !important;
+            }
             """
         )
 
@@ -589,6 +620,7 @@ with SinglePageLayout(server) as layout:
             mouseenter=INIT_VIEWPORT_JS,
             mousemove=MOUSEMOVE_JS,
             mouseleave="mouse_data = null; tooltip_visible = false",
+            wheel="particle_active = false; particle_frame = ''",
         ):
             with leaflet.LMap(
                 zoom=("zoom", 3),
@@ -614,6 +646,7 @@ with SinglePageLayout(server) as layout:
             # VTK-rendered particle overlay
             html_widgets.Img(
                 src=("particle_frame",),
+                classes="particle-overlay",
                 style=(
                     "position:absolute; top:0; left:0; "
                     "width:100%; height:100%; "
