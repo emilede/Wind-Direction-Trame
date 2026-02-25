@@ -1,7 +1,23 @@
 #!/usr/bin/env python3
 """
 Generate tile pyramid for wind visualization using VTK.
-Composites wind color with grayscale terrain for Zoom Earth-like effect.
+
+RENDERING APPROACH (for thesis documentation):
+===============================================
+Instead of Delaunay triangulation (which interpolates within triangles and
+can leave visible edges at triangle boundaries), this pipeline uses per-pixel
+interpolation from a regular grid:
+
+1. Wind data (already a regular grid from convert.py) is reshaped directly
+2. For each tile, pixel coordinates are converted to lat/lng via Web Mercator
+3. Wind speed at each pixel is bilinearly interpolated from the regular grid
+4. The speed values are packed into a vtkImageData structure
+5. VTK's vtkImageMapToColors applies the colormap via a vtkLookupTable
+6. The resulting RGB image is composited with terrain hillshade
+
+This produces perfectly smooth, per-pixel color gradients with zero triangle
+artifacts, matching the quality of professional weather visualization services.
+===============================================
 """
 
 import json
@@ -10,23 +26,22 @@ import os
 import numpy as np
 import mercantile
 import vtk
+from vtk.util.numpy_support import numpy_to_vtk, vtk_to_numpy
 from PIL import Image
 from scipy.ndimage import gaussian_filter
 import urllib.request
 
 # ============ CONFIG ============
-TILE_SIZE = 256       # Output tile size
-RENDER_SCALE = 4      # 4x oversampling - Lanczos downsample smooths edges
-PADDING = 32          # Padding for blur
-MIN_ZOOM = 2
-MAX_ZOOM = 3          # 80 tiles (reduced for faster rendering)
+TILE_SIZE = 256
+RENDER_SCALE = 4
+PADDING = 32
+MIN_ZOOM = 3
+MAX_ZOOM = 5
 OUTPUT_DIR = os.path.abspath('data/tiles')
 TERRAIN_CACHE = os.path.abspath('data/terrain_cache')
 
-# Wind color settings
-GLOW_BLUR = 1      # Minimal blur - preserve sharp transitions
-DETAIL_BLUR = 0.3  # Light smoothing
-SPEED_GAMMA = 0.7
+GLOW_BLUR = 1
+DETAIL_BLUR = 0.3
 # ================================
 
 def log(msg):
@@ -35,314 +50,190 @@ def log(msg):
 
 
 def fetch_terrain_tile(z, x, y):
-    """Fetch grayscale hillshade tile from ESRI."""
     cache_path = os.path.join(TERRAIN_CACHE, str(z), str(x), f"{y}.png")
-    
     if os.path.exists(cache_path):
-        img = Image.open(cache_path).convert('L')  # Grayscale
-        # Resize to match our tile size if needed
+        img = Image.open(cache_path).convert('L')
         if img.size != (TILE_SIZE, TILE_SIZE):
             img = img.resize((TILE_SIZE, TILE_SIZE), Image.LANCZOS)
         return np.array(img)
-    
-    # ESRI World Hillshade DARK (better for color overlay)
+
     url = f"https://services.arcgisonline.com/arcgis/rest/services/Elevation/World_Hillshade_Dark/MapServer/tile/{z}/{y}/{x}"
-    
     try:
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         urllib.request.urlretrieve(url, cache_path)
         img = Image.open(cache_path).convert('L')
-        # Resize to match our tile size if needed
         if img.size != (TILE_SIZE, TILE_SIZE):
             img = img.resize((TILE_SIZE, TILE_SIZE), Image.LANCZOS)
         return np.array(img)
     except Exception as e:
         log(f"  Warning: terrain fetch failed for {z}/{x}/{y}: {e}")
-        # Return neutral gray if fetch fails
         return np.full((TILE_SIZE, TILE_SIZE), 128, dtype=np.uint8)
 
 
 def create_vtk_lut():
-    """Create VTK lookup table with bell curve saturation.
-    Darkest at 0 and 35, brightest around 15-20 m/s (middle)."""
+    """Create VTK lookup table with exact Zoom Earth colors (pixel-sampled)."""
+    # Colors sampled directly from Zoom Earth at each mph value
+    # Format: (t, (R, G, B)) where t = speed_ms / 35
     colors = [
-        # 0 m/s - bluish purple (DARK)
-        (0.000, (30, 20, 80)),
-        
-        # 1 m/s - dark blue
-        (0.029, (20, 30, 100)),
-        
-        # 3 m/s - blue
-        (0.086, (35, 60, 140)),
-        
-        # 5 m/s - light blue
-        (0.143, (50, 100, 180)),
-        
-        # 7.5 m/s - light blue (brighter)
-        (0.214, (60, 130, 190)),
-        
-        # 10 m/s - cyan (bright)
-        (0.286, (70, 190, 210)),
-        
-        # 11 m/s - cyan-green (bright)
-        (0.314, (60, 210, 160)),
-        
-        # 12 m/s - green (toned down)
-        (0.343, (50, 180, 70)),
-        
-        # 13 m/s - bright green (toned down)
-        (0.371, (100, 190, 55)),
-        
-        # 14 m/s - lime (toned down)
-        (0.400, (150, 200, 50)),
-        
-        # 15 m/s - yellow (BRIGHTEST)
-        (0.429, (240, 240, 70)),
-        
-        # 16 m/s - yellow-gold (BRIGHTEST)
-        (0.457, (250, 220, 60)),
-        
-        # 17.5 m/s - gold (BRIGHTEST - peak)
-        (0.500, (255, 200, 50)),
-        
-        # 19 m/s - gold-orange (bright)
-        (0.543, (250, 160, 45)),
-        
-        # 20 m/s - orange (bright)
-        (0.571, (245, 120, 45)),
-        
-        # 21.5 m/s - orange-red (getting darker)
-        (0.614, (220, 90, 50)),
-        
-        # 23 m/s - red-orange (darker)
-        (0.657, (190, 65, 55)),
-        
-        # 25 m/s - deep red (dark)
-        (0.714, (160, 50, 60)),
-        
-        # 27.5 m/s - red-magenta (darker)
-        (0.786, (140, 40, 75)),
-        
-        # 30 m/s - magenta (dark)
-        (0.857, (120, 35, 85)),
-        
-        # 32.5 m/s - dark magenta (DARK)
-        (0.929, (100, 30, 80)),
-        
-        # 35 m/s - deep magenta (DARKEST)
-        (1.000, (80, 25, 70)),
+        # 0 mph (0 m/s)
+        (0.000, (91, 70, 168)),
+        # 5 mph (2.24 m/s)
+        (0.064, (87, 112, 195)),
+        # 10 mph (4.47 m/s)
+        (0.128, (95, 155, 207)),
+        # 15 mph (6.71 m/s)
+        (0.192, (113, 196, 201)),
+        # 20 mph (8.94 m/s)
+        (0.255, (133, 225, 174)),
+        # 25 mph (11.18 m/s)
+        (0.319, (176, 234, 154)),
+        # 30 mph (13.41 m/s)
+        (0.383, (228, 242, 145)),
+        # 35 mph (15.65 m/s)
+        (0.447, (245, 228, 134)),
+        # 40 mph (17.88 m/s)
+        (0.511, (248, 192, 123)),
+        # 45 mph (20.12 m/s)
+        (0.575, (243, 156, 112)),
+        # 50 mph (22.35 m/s)
+        (0.639, (231, 127, 105)),
+        # 55 mph (24.59 m/s)
+        (0.703, (216, 105, 99)),
+        # 60 mph (26.82 m/s)
+        (0.766, (196, 88, 99)),
+        # 65 mph (29.06 m/s)
+        (0.830, (174, 74, 103)),
+        # 70 mph (31.29 m/s)
+        (0.894, (155, 62, 106)),
+        # 75 mph (33.53 m/s)
+        (0.958, (138, 50, 105)),
+        # 80 mph (35.76 m/s)
+        (1.000, (122, 39, 106)),
     ]
-    
+
     lut = vtk.vtkLookupTable()
-    lut.SetNumberOfTableValues(1024)  # Higher resolution for smoother gradients
-    lut.SetRange(0, 35)  # 0-35 m/s
-    
+    lut.SetNumberOfTableValues(1024)
+    lut.SetRange(0, 35)
+
     for i in range(1024):
         t = i / 1023.0
-        
         for j in range(len(colors) - 1):
             if colors[j][0] <= t <= colors[j+1][0]:
                 t0, c0 = colors[j]
                 t1, c1 = colors[j+1]
                 frac = (t - t0) / (t1 - t0) if t1 > t0 else 0
-                
                 r = (c0[0] + frac * (c1[0] - c0[0])) / 255
                 g = (c0[1] + frac * (c1[1] - c0[1])) / 255
                 b = (c0[2] + frac * (c1[2] - c0[2])) / 255
-                
-                lut.SetTableValue(i, r, g, b, 1.0)  # Fully opaque
+                lut.SetTableValue(i, r, g, b, 1.0)
                 break
-    
+
     lut.Build()
     return lut
 
 
 class TileRenderer:
-    """Reusable VTK renderer for generating tiles."""
-    
     def __init__(self, tile_size, render_scale, padding, lut):
         self.tile_size = tile_size
         self.padding = padding
         self.render_scale = render_scale
         self.lut = lut
-        
         self.padded_size = tile_size + 2 * padding
         self.render_size = self.padded_size * render_scale
-        
-        self.render_window = vtk.vtkRenderWindow()
-        self.render_window.SetOffScreenRendering(1)
-        self.render_window.SetSize(self.render_size, self.render_size)
-        
-        self.renderer = vtk.vtkRenderer()
-        self.renderer.SetBackground(0, 0, 0)
-        self.render_window.AddRenderer(self.renderer)
-        
-        camera = self.renderer.GetActiveCamera()
-        camera.ParallelProjectionOn()
-        camera.SetPosition(self.render_size/2, self.render_size/2, 100)
-        camera.SetFocalPoint(self.render_size/2, self.render_size/2, 0)
-        camera.SetParallelScale(self.render_size/2)
-        
-        self.w2i = vtk.vtkWindowToImageFilter()
-        self.w2i.SetInput(self.render_window)
-        self.w2i.SetInputBufferTypeToRGB()  # No alpha needed
-    
-    def render_wind_color(self, lons, lats, speeds, z, x, y):
-        """Render wind as solid color (no alpha)."""
+
+    def render_wind_color(self, speed_grid, grid_lats, grid_lons, z, x, y):
+        size = self.render_size
         bounds = mercantile.bounds(x, y, z)
         lon_min, lat_min, lon_max, lat_max = bounds.west, bounds.south, bounds.east, bounds.north
-        
+
         lon_range = lon_max - lon_min
-        lat_range = lat_max - lat_min
-        pad_frac = self.padding / self.tile_size
-        geo_lon_pad = lon_range * (pad_frac + 0.1)
-        geo_lat_pad = lat_range * (pad_frac + 0.1)
-        
-        mask = (
-            (lons >= lon_min - geo_lon_pad) & (lons <= lon_max + geo_lon_pad) &
-            (lats >= lat_min - geo_lat_pad) & (lats <= lat_max + geo_lat_pad)
-        )
-        
-        if mask.sum() < 4:
-            return None
-        
-        tile_lons = lons[mask]
-        tile_lats = lats[mask]
-        tile_speeds = speeds[mask]
-        
-        n = 2 ** z
-        
-        # Calculate padded bounds (in geographic coordinates)
         pad_frac = self.padding / self.tile_size
         padded_lon_min = lon_min - lon_range * pad_frac
         padded_lon_max = lon_max + lon_range * pad_frac
-        
-        def lat_to_merc_y(lat):
-            lat_rad = np.radians(np.clip(lat, -85.05, 85.05))
-            return (1 - np.log(np.tan(lat_rad) + 1/np.cos(lat_rad)) / np.pi) / 2
-        
-        def merc_y_to_lat(merc_y):
-            return np.degrees(np.arctan(np.sinh(np.pi * (1 - 2 * merc_y))))
-        
+
+        n = 2 ** z
         tile_merc_min = y / n
         tile_merc_max = (y + 1) / n
         merc_range = tile_merc_max - tile_merc_min
         padded_merc_min = tile_merc_min - merc_range * pad_frac
         padded_merc_max = tile_merc_max + merc_range * pad_frac
-        
-        # Project source points to pixel coordinates
-        px = (tile_lons - padded_lon_min) / (padded_lon_max - padded_lon_min) * self.render_size
-        merc_y = lat_to_merc_y(tile_lats)
-        py = (merc_y - padded_merc_min) / (padded_merc_max - padded_merc_min) * self.render_size
-        
-        # Create source points for Delaunay triangulation
-        points = vtk.vtkPoints()
-        for i in range(len(px)):
-            points.InsertNextPoint(px[i], self.render_size - py[i], 0)
-        
-        scalars = vtk.vtkFloatArray()
-        scalars.SetName("speed")
-        for s in tile_speeds:
-            scalars.InsertNextValue(s)
-        
-        polydata = vtk.vtkPolyData()
-        polydata.SetPoints(points)
-        polydata.GetPointData().SetScalars(scalars)
-        
-        # Triangulate the scattered points
-        delaunay = vtk.vtkDelaunay2D()
-        delaunay.SetInputData(polydata)
-        delaunay.SetTolerance(0.001)
-        delaunay.Update()
-        
-        # Subdivide triangles for smoother color transitions
-        subdivide = vtk.vtkLinearSubdivisionFilter()
-        subdivide.SetInputConnection(delaunay.GetOutputPort())
-        subdivide.SetNumberOfSubdivisions(2)  # Each triangle -> 16 smaller triangles
-        subdivide.Update()
-        
-        # DIAGNOSTIC
-        if not hasattr(self, '_diag_count'):
-            self._diag_count = 0
-        self._diag_count += 1
-        
-        if self._diag_count <= 3 or tile_speeds.max() > 20:
-            log(f"\n  === DIAGNOSTIC for tile {z}/{x}/{y} ===")
-            log(f"  Input speeds: min={tile_speeds.min():.2f}, max={tile_speeds.max():.2f}")
-            d_scalars = subdivide.GetOutput().GetPointData().GetScalars()
-            if d_scalars:
-                d_range = d_scalars.GetRange()
-                log(f"  Subdivided scalars: min={d_range[0]:.2f}, max={d_range[1]:.2f}")
-            log(f"  ===========================")
-        
-        # Render subdivided mesh with Gouraud shading
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputConnection(subdivide.GetOutputPort())
-        mapper.SetLookupTable(self.lut)
-        mapper.SetScalarRange(0, 35)
-        mapper.SetInterpolateScalarsBeforeMapping(True)
-        
-        actor = vtk.vtkActor()
-        actor.SetMapper(mapper)
-        actor.GetProperty().SetInterpolationToGouraud()
-        
-        self.renderer.RemoveAllViewProps()
-        self.renderer.AddActor(actor)
-        self.render_window.Render()
-        
-        self.w2i.Modified()
-        self.w2i.Update()
-        
-        vtk_image = self.w2i.GetOutput()
-        width, height, _ = vtk_image.GetDimensions()
-        vtk_array = vtk_image.GetPointData().GetScalars()
-        arr = np.frombuffer(vtk_array, dtype=np.uint8).reshape(height, width, 3)
+
+        pixel_lons = np.linspace(padded_lon_min, padded_lon_max, size)
+        pixel_merc = np.linspace(padded_merc_min, padded_merc_max, size)
+        pixel_lats = np.degrees(np.arctan(np.sinh(np.pi * (1 - 2 * pixel_merc))))
+
+        lat_step = abs(grid_lats[0] - grid_lats[1])
+        lon_step = abs(grid_lons[1] - grid_lons[0])
+
+        lat_frac_1d = (grid_lats[0] - pixel_lats) / lat_step
+        lon_frac_1d = (pixel_lons - grid_lons[0]) / lon_step
+
+        lon_frac_2d, lat_frac_2d = np.meshgrid(lon_frac_1d, lat_frac_1d)
+
+        lat_0 = np.clip(np.floor(lat_frac_2d).astype(int), 0, speed_grid.shape[0] - 2)
+        lon_0 = np.clip(np.floor(lon_frac_2d).astype(int), 0, speed_grid.shape[1] - 2)
+        lat_f = np.clip(lat_frac_2d - lat_0, 0, 1)
+        lon_f = np.clip(lon_frac_2d - lon_0, 0, 1)
+
+        speeds = (
+            speed_grid[lat_0, lon_0] * (1 - lat_f) * (1 - lon_f) +
+            speed_grid[lat_0 + 1, lon_0] * lat_f * (1 - lon_f) +
+            speed_grid[lat_0, lon_0 + 1] * (1 - lat_f) * lon_f +
+            speed_grid[lat_0 + 1, lon_0 + 1] * lat_f * lon_f
+        )
+
+        image_data = vtk.vtkImageData()
+        image_data.SetDimensions(size, size, 1)
+        image_data.SetSpacing(1.0, 1.0, 1.0)
+        image_data.SetOrigin(0, 0, 0)
+
+        speed_for_vtk = speeds[::-1, :].ravel().astype(np.float32)
+        vtk_scalars = numpy_to_vtk(speed_for_vtk, deep=True)
+        vtk_scalars.SetName("speed")
+        image_data.GetPointData().SetScalars(vtk_scalars)
+
+        color_map = vtk.vtkImageMapToColors()
+        color_map.SetLookupTable(self.lut)
+        color_map.SetOutputFormatToRGB()
+        color_map.SetInputData(image_data)
+        color_map.Update()
+
+        output = color_map.GetOutput()
+        rgb_vtk = output.GetPointData().GetScalars()
+        arr = vtk_to_numpy(rgb_vtk).reshape(size, size, 3)
         arr = np.flipud(arr.copy())
-        
-        # Return padded image - blur and crop happens in composite_tile
         return arr
-    
+
     def composite_tile(self, wind_rgb_padded, terrain_gray):
-        """Blend wind color with terrain - apply blur BEFORE cropping."""
-        
-        # Apply glow blur to padded image (before crop!)
         glow = np.zeros_like(wind_rgb_padded, dtype=float)
         for c in range(3):
             glow[:, :, c] = gaussian_filter(wind_rgb_padded[:, :, c].astype(float), sigma=GLOW_BLUR)
-        
-        # Apply detail blur to padded image
+
         detail = np.zeros_like(wind_rgb_padded, dtype=float)
         for c in range(3):
             detail[:, :, c] = gaussian_filter(wind_rgb_padded[:, :, c].astype(float), sigma=DETAIL_BLUR)
-        
-        # Combine glow and detail - favor detail to preserve reds
+
         wind_combined = (glow * 0.2 + detail * 0.8)
-        
-        # NOW crop the padding (after blur)
+
         crop_start = self.padding * self.render_scale
         crop_end = crop_start + self.tile_size * self.render_scale
         wind_cropped = wind_combined[crop_start:crop_end, crop_start:crop_end]
-        
-        # Resize terrain to match cropped wind
+
         if terrain_gray.shape[0] != wind_cropped.shape[0]:
             terrain_img = Image.fromarray(terrain_gray)
             terrain_img = terrain_img.resize((wind_cropped.shape[1], wind_cropped.shape[0]), Image.LANCZOS)
             terrain_gray = np.array(terrain_img)
-        
-        # Normalize terrain to 0-1, boost it significantly
+
         terrain_norm = terrain_gray.astype(float) / 255.0
-        terrain_norm = np.clip(terrain_norm * 2.0, 0, 1)  # Brighten terrain a lot
-        
-        # Screen blend: result = 1 - (1-terrain) * (1-wind)
+        terrain_norm = np.clip(terrain_norm * 2.0, 0, 1)
+
         result = np.zeros((wind_cropped.shape[0], wind_cropped.shape[1], 3), dtype=float)
         for c in range(3):
             w = wind_cropped[:, :, c] / 255.0
             t = terrain_norm
-            result[:, :, c] = 1 - (1 - t * 0.3) * (1 - w)
-        
-        # Mild brightness boost - preserve dark colors
-        result = np.clip(result * 255 * 1.1, 0, 255).astype(np.uint8)
-        
+            result[:, :, c] = 1 - (1 - t * 0.1) * (1 - w)
+
+        result = np.clip(result * 255, 0, 255).astype(np.uint8)
         return result
 
 
@@ -350,87 +241,119 @@ def main():
     log("Loading wind data...")
     with open('data/wind_data.json') as f:
         wind_data = json.load(f)
-    
-    lons = np.array([p['lon'] for p in wind_data])
-    lats = np.array([p['lat'] for p in wind_data])
-    speeds = np.array([p['speed'] for p in wind_data])
-    log(f"Loaded {len(wind_data):,} points")
-    log(f"GLOBAL SPEEDS: min={speeds.min():.2f}, max={speeds.max():.2f}, mean={speeds.mean():.2f} m/s")
-    
-    # Handle antimeridian wrapping
-    east_mask = lons > 170
-    west_mask = lons < -170
-    
-    all_lons = lons.copy()
-    all_lats = lats.copy()
-    all_speeds = speeds.copy()
-    
-    if east_mask.any():
-        all_lons = np.concatenate([all_lons, lons[east_mask] - 360])
-        all_lats = np.concatenate([all_lats, lats[east_mask]])
-        all_speeds = np.concatenate([all_speeds, speeds[east_mask]])
-    if west_mask.any():
-        all_lons = np.concatenate([all_lons, lons[west_mask] + 360])
-        all_lats = np.concatenate([all_lats, lats[west_mask]])
-        all_speeds = np.concatenate([all_speeds, speeds[west_mask]])
-    
-    lons, lats, speeds = all_lons, all_lats, all_speeds
-    log(f"After wrapping: {len(lons):,} points")
-    
-    # Create renderer
+
+    n_points = len(wind_data)
+    log(f"Loaded {n_points:,} points")
+
+    speeds = np.array([p['speed'] for p in wind_data], dtype=np.float32)
+
+    # Figure out grid dimensions
+    first_lat = wind_data[0]['lat']
+    n_lons = 0
+    for p in wind_data:
+        if p['lat'] == first_lat:
+            n_lons += 1
+        else:
+            break
+
+    n_lats = n_points // n_lons
+    assert n_lats * n_lons == n_points, f"Grid not rectangular: {n_lats} x {n_lons} != {n_points}"
+    log(f"Grid dimensions: {n_lats} x {n_lons}")
+
+    speed_grid = speeds.reshape(n_lats, n_lons)
+
+    grid_lats_asc = np.array([wind_data[i * n_lons]['lat'] for i in range(n_lats)])
+    grid_lons_raw = np.array([wind_data[j]['lon'] for j in range(n_lons)])
+
+    log(f"Lats: {grid_lats_asc[0]} to {grid_lats_asc[-1]}")
+    log(f"Lons raw: {grid_lons_raw[0]} to {grid_lons_raw[-1]}")
+
+    # Rearrange lons from 0..180,-179..-0.25 to -180..180
+    neg_start = None
+    for i in range(1, len(grid_lons_raw)):
+        if grid_lons_raw[i] < grid_lons_raw[i - 1]:
+            neg_start = i
+            break
+
+    if neg_start is not None:
+        log(f"Lon wraparound at index {neg_start}")
+        grid_lons = np.concatenate([grid_lons_raw[neg_start:], grid_lons_raw[:neg_start]])
+        speed_grid = np.concatenate([speed_grid[:, neg_start:], speed_grid[:, :neg_start]], axis=1)
+    else:
+        grid_lons = grid_lons_raw
+
+    # Flip lats to descending (90 to -90)
+    grid_lats = grid_lats_asc[::-1]
+    speed_grid = speed_grid[::-1, :]
+
+    log(f"Final grid: {speed_grid.shape}")
+    log(f"Lats: {grid_lats[0]:.4f} to {grid_lats[-1]:.4f}")
+    log(f"Lons: {grid_lons[0]:.4f} to {grid_lons[-1]:.4f}")
+    log(f"Speed range: {speed_grid.min():.2f} - {speed_grid.max():.2f} m/s")
+
+    # Extend grid for antimeridian wrapping
+    wrap_cols = 60
+    speed_grid = np.concatenate([
+        speed_grid[:, -wrap_cols:],
+        speed_grid,
+        speed_grid[:, :wrap_cols]
+    ], axis=1)
+    grid_lons = np.concatenate([
+        grid_lons[-wrap_cols:] - 360,
+        grid_lons,
+        grid_lons[:wrap_cols] + 360
+    ])
+    log(f"Extended grid for wrapping: {speed_grid.shape}")
+
+    del wind_data, speeds
+
     lut = create_vtk_lut()
     tile_renderer = TileRenderer(TILE_SIZE, RENDER_SCALE, PADDING, lut)
-    log("VTK renderer initialized")
-    
-    # Create directories
+    log("VTK image renderer initialized")
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(TERRAIN_CACHE, exist_ok=True)
-    
+
     for z in range(MIN_ZOOM, MAX_ZOOM + 1):
         n_tiles = 2 ** z
         for tx in range(n_tiles):
             os.makedirs(os.path.join(OUTPUT_DIR, str(z), str(tx)), exist_ok=True)
     log("Created directories")
-    
+
     total_tiles = sum(4 ** z for z in range(MIN_ZOOM, MAX_ZOOM + 1))
     tile_count = 0
-    
+
     for z in range(MIN_ZOOM, MAX_ZOOM + 1):
         n_tiles = 2 ** z
         log(f"\nZoom {z}: {n_tiles}x{n_tiles} tiles")
-        
+
         for tx in range(n_tiles):
             for ty in range(n_tiles):
                 tile_count += 1
                 tile_dir = os.path.join(OUTPUT_DIR, str(z), str(tx))
                 tile_path = os.path.join(tile_dir, f"{ty}.png")
-                
-                # Ensure directory exists
                 os.makedirs(tile_dir, exist_ok=True)
-                
-                # Render wind color
-                wind_rgb = tile_renderer.render_wind_color(lons, lats, speeds, z, tx, ty)
-                
+
+                wind_rgb = tile_renderer.render_wind_color(
+                    speed_grid, grid_lats, grid_lons, z, tx, ty
+                )
+
                 if wind_rgb is None:
                     empty = Image.new('RGB', (TILE_SIZE, TILE_SIZE), (0, 0, 0))
                     empty.save(tile_path)
                     continue
-                
-                # Fetch terrain
+
                 terrain_gray = fetch_terrain_tile(z, tx, ty)
-                
-                # Composite
                 result = tile_renderer.composite_tile(wind_rgb, terrain_gray)
-                
-                # Save
+
                 img = Image.fromarray(result)
                 if img.size != (TILE_SIZE, TILE_SIZE):
                     img = img.resize((TILE_SIZE, TILE_SIZE), Image.LANCZOS)
                 img.save(tile_path, optimize=True)
-                
+
                 if tile_count % 10 == 0:
                     log(f"  Progress: {tile_count}/{total_tiles} tiles")
-    
+
     log(f"\n✓ Done: {tile_count} tiles saved to {OUTPUT_DIR}/")
 
 
