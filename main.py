@@ -1,17 +1,27 @@
 """
 Wind visualization with pre-rendered tiles and VTK-rendered wind particles.
+
+Architecture:
+- VTK renders particle segments off-screen each frame (server-side, main thread)
+- Trail is composited into an RGB numpy buffer (black background = transparent via CSS)
+- PIL encodes the trail to JPEG in a thread executor (non-blocking)
+- Frame is pushed as a base64 data URI to a CSS-overlaid <img> element
+- mix-blend-mode: screen makes black pixels transparent over the Leaflet map
+
+This demonstrates the server-side VTK rendering pipeline limitation vs JS Canvas2D.
 """
 
 import os
+import io
 import json
 import time
 import math
-import asyncio
-import io
 import base64
+import asyncio
 import numpy as np
 import vtk
-from vtk.util.numpy_support import vtk_to_numpy
+from vtk.util.numpy_support import numpy_to_vtk
+from vtk.util import numpy_support as vtk_numpy_support
 from PIL import Image
 from aiohttp import web
 from trame.app import get_server
@@ -84,94 +94,145 @@ def lookup_wind_tooltip(lat, lon):
 # ============ VTK PARTICLE RENDERER ============
 
 class ParticleRenderer:
-    """Off-screen VTK renderer for particle line segments."""
+    """Off-screen VTK renderer: particle segments → RGBA numpy array.
+
+    Renders bright white lines on a black background. The caller composites
+    these into a trail buffer. Black = transparent via mix-blend-mode:screen.
+    """
+
+    RENDER_SCALE = 0.6  # render at 60% of display size, upscale via CSS
 
     def __init__(self, width, height):
-        self.width = width
-        self.height = height
+        self.full_width = width
+        self.full_height = height
+        self.width = max(1, int(width * self.RENDER_SCALE))
+        self.height = max(1, int(height * self.RENDER_SCALE))
 
         self.render_window = vtk.vtkRenderWindow()
         self.render_window.SetOffScreenRendering(1)
-        self.render_window.SetSize(width, height)
         self.render_window.SetAlphaBitPlanes(1)
         self.render_window.SetMultiSamples(0)
+        self.render_window.SetSize(self.width, self.height)
 
         self.renderer = vtk.vtkRenderer()
         self.renderer.SetBackground(0, 0, 0)
-        self.renderer.SetBackgroundAlpha(0.0)
         self.render_window.AddRenderer(self.renderer)
 
-        self.points = vtk.vtkPoints()
-        self.lines = vtk.vtkCellArray()
         self.polydata = vtk.vtkPolyData()
-        self.polydata.SetPoints(self.points)
-        self.polydata.SetLines(self.lines)
-
         self.mapper = vtk.vtkPolyDataMapper()
         self.mapper.SetInputData(self.polydata)
 
         self.actor = vtk.vtkActor()
         self.actor.SetMapper(self.mapper)
-        self.actor.GetProperty().SetColor(1.0, 1.0, 1.0)
-        self.actor.GetProperty().SetOpacity(0.6)
+        self.actor.GetProperty().SetColor(1, 1, 1)
         self.actor.GetProperty().SetLineWidth(2.0)
+        self.actor.GetProperty().SetOpacity(1.0)
         self.renderer.AddActor(self.actor)
-
-        self._setup_camera()
 
         self.w2i = vtk.vtkWindowToImageFilter()
         self.w2i.SetInput(self.render_window)
-        self.w2i.SetInputBufferTypeToRGBA()
+        self.w2i.SetInputBufferTypeToRGB()
         self.w2i.ReadFrontBufferOff()
+
+        self._setup_camera()
+
+        # Warmup: trigger OpenGL context creation + shader compilation NOW,
+        # on the main thread, before asyncio starts. Without this, the first
+        # Render() in the animation loop blocks for 10-20s (macOS GL init),
+        # killing the WebSocket PONG heartbeat.
+        self.render_window.Render()
 
     def _setup_camera(self):
         camera = self.renderer.GetActiveCamera()
         camera.SetParallelProjection(True)
         camera.SetPosition(self.width / 2, self.height / 2, 1)
         camera.SetFocalPoint(self.width / 2, self.height / 2, 0)
+        camera.SetViewUp(0, 1, 0)
         camera.SetParallelScale(self.height / 2)
         self.renderer.ResetCameraClippingRange()
 
     def resize(self, width, height):
-        self.width = width
-        self.height = height
-        self.render_window.SetSize(width, height)
+        self.full_width = width
+        self.full_height = height
+        self.width = max(1, int(width * self.RENDER_SCALE))
+        self.height = max(1, int(height * self.RENDER_SCALE))
+        self.render_window.SetSize(self.width, self.height)
         self._setup_camera()
 
     def render_frame(self, segments):
-        """
-        Render line segments and return RGBA numpy array.
-        segments: Nx4 array of (x0, y0, x1, y1) in pixel coords.
-        Returns: (height, width, 4) uint8 array.
-        """
-        self.points.Reset()
-        self.lines.Reset()
+        """Render segments off-screen. Returns H×W×3 RGB uint8 array."""
+        if len(segments) == 0:
+            return np.zeros((self.height, self.width, 3), dtype=np.uint8)
 
         n = len(segments)
-        if n == 0:
-            return np.zeros((self.height, self.width, 4), dtype=np.uint8)
+        sx = self.width / self.full_width
+        sy = self.height / self.full_height
 
-        self.points.SetNumberOfPoints(n * 2)
-        for i in range(n):
-            # VTK Y is bottom-up, so flip Y coordinates
-            self.points.SetPoint(i * 2, segments[i, 0], self.height - segments[i, 1], 0)
-            self.points.SetPoint(i * 2 + 1, segments[i, 2], self.height - segments[i, 3], 0)
+        pts = np.zeros((n * 2, 3), dtype=np.float32)
+        pts[0::2, 0] = segments[:, 0] * sx
+        pts[0::2, 1] = self.height - segments[:, 1] * sy   # VTK Y-up
+        pts[1::2, 0] = segments[:, 2] * sx
+        pts[1::2, 1] = self.height - segments[:, 3] * sy
 
-        for i in range(n):
-            self.lines.InsertNextCell(2)
-            self.lines.InsertCellPoint(i * 2)
-            self.lines.InsertCellPoint(i * 2 + 1)
+        vtk_points = vtk.vtkPoints()
+        vtk_points.SetData(numpy_to_vtk(pts, deep=True, array_type=vtk.VTK_FLOAT))
 
+        offsets = np.arange(0, (n + 1) * 2, 2, dtype=np.int64)
+        connectivity = np.arange(n * 2, dtype=np.int64)
+        lines = vtk.vtkCellArray()
+        lines.SetData(
+            numpy_to_vtk(offsets, deep=True, array_type=vtk.VTK_ID_TYPE),
+            numpy_to_vtk(connectivity, deep=True, array_type=vtk.VTK_ID_TYPE),
+        )
+
+        self.polydata.SetPoints(vtk_points)
+        self.polydata.SetLines(lines)
         self.polydata.Modified()
+
         self.render_window.Render()
+
         self.w2i.Modified()
         self.w2i.Update()
 
-        output = self.w2i.GetOutput()
-        dims = output.GetDimensions()
-        rgba = vtk_to_numpy(output.GetPointData().GetScalars())
-        rgba = rgba.reshape(dims[1], dims[0], -1)
-        return np.flipud(rgba[:, :, :4].copy())
+        vtk_img = self.w2i.GetOutput()
+        w, h, _ = vtk_img.GetDimensions()
+        arr = vtk_numpy_support.vtk_to_numpy(vtk_img.GetPointData().GetScalars())
+        return np.flipud(arr.reshape(h, w, 3))
+
+
+class TrailCompositor:
+    """RGB float32 trail buffer. Fades particle trails, encodes to JPEG.
+
+    Particles are white, background is black. JPEG is ~10x smaller than PNG
+    (~15-30KB vs 150-300KB), keeping the WebSocket from overloading.
+    The <img> overlay uses mix-blend-mode:screen so black = transparent.
+    """
+
+    def __init__(self, width, height, fade_alpha=0.92):
+        self.fade_alpha = fade_alpha
+        self.trail = np.zeros((height, width, 3), dtype=np.float32)
+
+    def blend(self, new_frame_rgb):
+        """Fade existing trail and stamp new particle pixels. Main thread."""
+        self.trail *= self.fade_alpha
+        mask = new_frame_rgb.max(axis=2) > 10   # non-black = particle segment
+        self.trail[mask] = 255.0                 # white particle
+
+    @staticmethod
+    def encode_snapshot(trail_rgb):
+        """Encode RGB trail to JPEG base64 data URI. Thread-safe, blocking."""
+        frame_uint8 = np.clip(trail_rgb, 0, 255).astype(np.uint8)
+        img = Image.fromarray(frame_uint8, 'RGB')
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=80)
+        b64 = base64.b64encode(buf.getvalue()).decode('ascii')
+        return f"data:image/jpeg;base64,{b64}"
+
+    def clear(self):
+        self.trail[:] = 0
+
+    def resize(self, width, height):
+        self.trail = np.zeros((height, width, 3), dtype=np.float32)
 
 
 # ============ PARTICLE SIMULATION ============
@@ -215,16 +276,13 @@ class ParticleSimulation:
         """Convert screen pixel coords to lat/lon (vectorized, Web Mercator)."""
         total_pixels = 256.0 * (2 ** self.zoom)
 
-        # Center of map in world pixel coordinates
         cx_world = (self.center_lon + 180.0) / 360.0 * total_pixels
         lat_rad = math.radians(self.center_lat)
         cy_world = (1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0 * total_pixels
 
-        # Screen pixel -> world pixel
         wx = cx_world + (px - self.width / 2.0)
         wy = cy_world + (py - self.height / 2.0)
 
-        # World pixel -> lat/lon (inverse Web Mercator)
         lon = wx / total_pixels * 360.0 - 180.0
         merc_y = math.pi * (1.0 - 2.0 * wy / total_pixels)
         lat = np.degrees(np.arctan(np.sinh(merc_y)))
@@ -236,7 +294,6 @@ class ParticleSimulation:
         lons = np.where(lons > 180, lons - 360, lons)
         lons = np.where(lons < -180, lons + 360, lons)
 
-        # Grid indices (lats descending: index 0 = WIND_LAT_MAX)
         li = (WIND_LAT_MAX - lats) / WIND_LAT_STEP
         lj = (lons - WIND_LON_MIN) / WIND_LON_STEP
 
@@ -276,7 +333,6 @@ class ParticleSimulation:
         self.y += dy
         self.age += 1
 
-        # Build segments for particles that moved
         moved = (np.abs(dx) > 0.01) | (np.abs(dy) > 0.01)
         if moved.any():
             segments = np.column_stack([
@@ -286,7 +342,6 @@ class ParticleSimulation:
         else:
             segments = np.empty((0, 4))
 
-        # Respawn dead or out-of-bounds particles
         dead = ((self.age > self.max_age) |
                 (self.x < -10) | (self.x > self.width + 10) |
                 (self.y < -10) | (self.y > self.height + 10))
@@ -300,37 +355,7 @@ class ParticleSimulation:
         return segments
 
 
-# ============ TRAIL COMPOSITING ============
-
-class TrailCompositor:
-    """Maintains a fading trail buffer and encodes frames as base64 PNG."""
-
-    def __init__(self, width, height, fade_alpha=0.95):
-        self.fade_alpha = fade_alpha
-        self.trail = np.zeros((height, width, 4), dtype=np.float32)
-
-    def composite(self, new_frame_rgba):
-        """Fade trails, add new segments, return base64 PNG data URI."""
-        self.trail[:, :, 3] *= self.fade_alpha
-
-        mask = new_frame_rgba[:, :, 3] > 0
-        self.trail[mask] = new_frame_rgba[mask].astype(np.float32)
-
-        frame_uint8 = np.clip(self.trail, 0, 255).astype(np.uint8)
-        img = Image.fromarray(frame_uint8, 'RGBA')
-        buf = io.BytesIO()
-        img.save(buf, format='PNG', compress_level=1)
-        b64 = base64.b64encode(buf.getvalue()).decode('ascii')
-        return f"data:image/png;base64,{b64}"
-
-    def clear(self):
-        self.trail[:] = 0
-
-    def resize(self, width, height):
-        self.trail = np.zeros((height, width, 4), dtype=np.float32)
-
-
-# ============ TRAME STATE ============
+# ============ TRAME STATE + RENDERERS ============
 
 state.tooltip_visible = False
 state.tooltip_text = ""
@@ -340,16 +365,15 @@ state.tooltip_x = 0
 state.tooltip_y = 0
 state.mouse_data = None
 
-state.particle_frame = ""
 state.particle_active = True
+state.particle_frame = ""
 state.map_viewport = None
 
-# Render at half resolution — browser CSS scales up the <img>
-RENDER_SCALE = 0.5
+ctrl = server.controller
 
 simulation = ParticleSimulation()
-particle_renderer = ParticleRenderer(int(1200 * RENDER_SCALE), int(800 * RENDER_SCALE))
-compositor = TrailCompositor(int(1200 * RENDER_SCALE), int(800 * RENDER_SCALE))
+particle_renderer = ParticleRenderer(1200, 800)
+compositor = TrailCompositor(particle_renderer.width, particle_renderer.height)
 
 
 @state.change("mouse_data")
@@ -387,12 +411,9 @@ def on_viewport_change(map_viewport, **kwargs):
         height = int(map_viewport['height'])
         if width < 10 or height < 10:
             return
-        # Simulation works in full viewport coords; renderer at reduced resolution
         simulation.update_viewport(zoom, center[0], center[1], width, height)
-        rw = int(width * RENDER_SCALE)
-        rh = int(height * RENDER_SCALE)
-        particle_renderer.resize(rw, rh)
-        compositor.resize(rw, rh)
+        particle_renderer.resize(width, height)
+        compositor.resize(particle_renderer.width, particle_renderer.height)
     except Exception:
         pass
 
@@ -408,19 +429,16 @@ def on_map_move(zoom, center, **kwargs):
     if not simulation._initialized:
         return
 
-    # Pause animation and clear the visible frame so particles
-    # don't stay "glued" to the old map position
     if not _map_move_paused:
         _map_move_paused = True
         state.particle_active = False
-        state.particle_frame = ""
         compositor.clear()
+        with state:
+            state.particle_frame = ""
 
-    # Cancel any pending viewport update
     if _viewport_update_task is not None:
         _viewport_update_task.cancel()
 
-    # Capture current values for the closure
     _zoom = int(zoom)
     _center = list(center)
 
@@ -441,21 +459,23 @@ def on_map_move(zoom, center, **kwargs):
 
 # ============ ANIMATION LOOP ============
 
-TARGET_FPS = 10
+TARGET_FPS = 20
 FRAME_INTERVAL = 1.0 / TARGET_FPS
 
 
 async def animation_loop():
-    """Server-side particle animation driven by VTK rendering.
+    """VTK off-screen render + PNG trail compositor.
 
-    Note: VTK's Cocoa render window on macOS requires the main thread,
-    so we cannot offload rendering to a thread pool. Instead we yield
-    to the event loop between frames with asyncio.sleep.
+    VTK render MUST stay on the main thread (macOS vtkCocoaRenderWindow).
+    PIL PNG encoding runs in a thread executor (non-blocking, ~10-20ms).
+    GL context is pre-warmed in ParticleRenderer.__init__ so renders are fast.
     """
+    loop = asyncio.get_event_loop()
+
     while not simulation._initialized:
         await asyncio.sleep(0.5)
 
-    print("Particle animation started")
+    print("Particle animation started (VTK off-screen + PNG trail)")
     frame_count = 0
     t_start = time.time()
 
@@ -466,17 +486,22 @@ async def animation_loop():
 
         t0 = time.time()
 
+        # VTK render + trail blend: main thread (Cocoa requires it, ~5-10ms)
         segments = simulation.step()
-        # Scale segments from full viewport coords to render resolution
-        if len(segments) > 0:
-            segments = segments * RENDER_SCALE
         new_frame = particle_renderer.render_frame(segments)
-        frame_uri = compositor.composite(new_frame)
+        compositor.blend(new_frame)
+        trail_snapshot = compositor.trail.copy()
 
-        # Yield so pending state changes (map move) can process
+        # Yield so map-move state changes can process
         await asyncio.sleep(0)
+        if not state.particle_active:
+            continue
 
-        # Don't push stale frame if animation was paused during render
+        # PNG encode in thread (non-blocking, ~10-20ms)
+        frame_uri = await loop.run_in_executor(
+            None, TrailCompositor.encode_snapshot, trail_snapshot
+        )
+
         if not state.particle_active:
             continue
 
@@ -484,25 +509,21 @@ async def animation_loop():
             state.particle_frame = frame_uri
 
         frame_count += 1
-        if frame_count % 100 == 0:
+        if frame_count % 50 == 0:
             elapsed_total = time.time() - t_start
             avg_fps = frame_count / elapsed_total
             frame_ms = (time.time() - t0) * 1000
             print(f"Particles: {frame_count} frames, avg {avg_fps:.1f} FPS, last frame {frame_ms:.0f}ms")
 
         elapsed = time.time() - t0
-        sleep_time = max(0.01, FRAME_INTERVAL - elapsed)
+        sleep_time = max(0.005, FRAME_INTERVAL - elapsed)
         await asyncio.sleep(sleep_time)
 
 
 @server.controller.add("on_server_ready")
 def start_animation(**kwargs):
-    # Start with default viewport so animation begins immediately
-    # (will be updated when client sends actual viewport dimensions)
     if not simulation._initialized:
         simulation.update_viewport(3, 20.0, 0.0, 1200, 800)
-        particle_renderer.resize(int(1200 * RENDER_SCALE), int(800 * RENDER_SCALE))
-        compositor.resize(int(1200 * RENDER_SCALE), int(800 * RENDER_SCALE))
         print("Initialized with default viewport (1200x800, zoom 3)")
     asyncio.ensure_future(animation_loop())
 
@@ -541,7 +562,6 @@ def on_bind(wslink_server):
 
 # ============ UI LAYOUT ============
 
-# Send viewport info on first mouse enter
 INIT_VIEWPORT_JS = (
     "if(typeof window!=='undefined'&&!window._vpInit){"
     "window._vpInit=true;"
@@ -557,8 +577,6 @@ INIT_VIEWPORT_JS = (
 MOUSEMOVE_JS = """
     if ($event.buttons > 0) {
         tooltip_visible = false;
-        particle_frame = '';
-        particle_active = false;
         return;
     }
     if (!window._ttThrottle || Date.now() - window._ttThrottle > 60) {
@@ -603,7 +621,9 @@ with SinglePageLayout(server) as layout:
                 background: #1a1128 !important;
             }
             .particle-overlay {
+                mix-blend-mode: screen;
                 transition: visibility 0s 0.5s;
+                pointer-events: none;
             }
             .v-container:has(.leaflet-dragging) > .particle-overlay,
             .v-container:has(.leaflet-zoom-anim) > .particle-overlay {
@@ -620,7 +640,7 @@ with SinglePageLayout(server) as layout:
             mouseenter=INIT_VIEWPORT_JS,
             mousemove=MOUSEMOVE_JS,
             mouseleave="mouse_data = null; tooltip_visible = false",
-            wheel="particle_active = false; particle_frame = ''",
+            wheel="particle_active = false",
         ):
             with leaflet.LMap(
                 zoom=("zoom", 3),
@@ -643,16 +663,15 @@ with SinglePageLayout(server) as layout:
                     maxZoom=5,
                 )
 
-            # VTK-rendered particle overlay
+            # Particle overlay: base64 JPEG pushed each frame, screen-blended over map
             html_widgets.Img(
-                src=("particle_frame",),
+                src=("particle_frame", ""),
                 classes="particle-overlay",
                 style=(
                     "position:absolute; top:0; left:0; "
                     "width:100%; height:100%; "
-                    "pointer-events:none; z-index:450;"
+                    "z-index:450;"
                 ),
-                v_show=("particle_frame",),
             )
 
         # Tooltip
