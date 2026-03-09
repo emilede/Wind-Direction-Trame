@@ -28,7 +28,7 @@ NUM_TILES = 2 ** ZOOM
 IMG_W = NUM_TILES * TILE_SIZE
 IMG_H = NUM_TILES * TILE_SIZE
 
-NUM_PARTICLES = 800
+NUM_PARTICLES = 1000
 MAX_AGE = 80
 SPEED_SCALE = 0.6
 MAX_WIND = 35
@@ -334,7 +334,7 @@ style.AddObserver("LeftButtonPressEvent", _left_down)
 style.AddObserver("LeftButtonReleaseEvent", _left_up)
 
 # Clamp camera: wrap horizontally, clamp vertically and zoom
-MIN_PARALLEL_SCALE = IMG_H / 16  # max zoom-in (~4x)
+MIN_PARALLEL_SCALE = 1  # essentially unlimited zoom-in
 _clamping = False
 
 def clamp_camera(obj=None, event=None):
@@ -369,6 +369,12 @@ def clamp_camera(obj=None, event=None):
     _clamping = False
 
 cam.AddObserver("ModifiedEvent", clamp_camera)
+
+# Also clamp on window resize (browser connect changes aspect ratio)
+def on_window_modified(obj=None, event=None):
+    clamp_camera()
+
+render_window.AddObserver("ModifiedEvent", on_window_modified)
 
 # Warmup render — initializes GL context before trame connects
 render_window.Render()
