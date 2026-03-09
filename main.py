@@ -1,5 +1,10 @@
 """
 Wind visualization with pre-rendered tiles and animated wind particles.
+
+Uses trame-native mechanisms:
+- server.enable_module() to serve and auto-load the particle JS module
+- client.ClientStateChange for reactive state watching
+- Trame state for particle control (particle_active, particle_count)
 """
 
 import os
@@ -11,6 +16,7 @@ from aiohttp import web
 from trame.app import get_server
 from trame.ui.vuetify3 import SinglePageLayout
 from trame.widgets import vuetify3 as v3, leaflet3 as leaflet, html as html_widgets
+from trame.widgets import client
 
 CACHE_BUST = int(time.time())
 
@@ -52,7 +58,7 @@ for p in wind_data:
 print(f"Tooltip grid: {len(lookup_grid)} points")
 print(f"Wind field grid: {len(field_u)} points")
 
-# Build wind field JSON (served to client for particle animation)
+# Build wind field JSON and write to www/ for trame module serving
 u_arr = []
 v_arr = []
 for lat_i in range(90, -91, -1):
@@ -67,9 +73,14 @@ wind_field_json = json.dumps({
     'n_lats': 181, 'n_lons': 361,
     'u': u_arr, 'v': v_arr
 })
-print(f"Wind field JSON: {len(wind_field_json) / 1024:.0f} KB")
 
-del wind_data, field_u, field_v, u_arr, v_arr
+os.makedirs('www', exist_ok=True)
+with open('www/wind_field.json', 'w') as f:
+    f.write(wind_field_json)
+
+print(f"Wind field JSON: {len(wind_field_json) / 1024:.0f} KB → www/wind_field.json")
+
+del wind_data, field_u, field_v, u_arr, v_arr, wind_field_json
 
 COMPASS = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
            'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
@@ -94,6 +105,10 @@ state.tooltip_arrow_rot = 0
 state.tooltip_x = 0
 state.tooltip_y = 0
 state.mouse_data = None
+
+# Particle control state (reactive via ClientStateChange)
+state.particle_active = True
+state.particle_count = 1500
 
 
 @state.change("mouse_data")
@@ -121,15 +136,14 @@ def on_mouse_move(mouse_data, **kwargs):
 
 # ============ TILE SERVING ============
 
+
 async def serve_tile(request):
     z = request.match_info['z']
     x = request.match_info['x']
     y = request.match_info['y']
     tile_path = f"./data/tiles/{z}/{x}/{y}.png"
     if os.path.exists(tile_path):
-        response = web.FileResponse(tile_path)
-        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-        return response
+        return web.FileResponse(tile_path, headers={'Cache-Control': 'public, max-age=3600'})
     return web.Response(status=404)
 
 
@@ -139,285 +153,25 @@ async def serve_border_tile(request):
     y = request.match_info['y']
     tile_path = f"./data/border_tiles/{z}/{x}/{y}.png"
     if os.path.exists(tile_path):
-        response = web.FileResponse(tile_path)
-        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-        return response
+        return web.FileResponse(tile_path, headers={'Cache-Control': 'public, max-age=3600'})
     return web.Response(status=404)
-
-
-async def serve_wind_field(request):
-    return web.Response(
-        text=wind_field_json,
-        content_type='application/json',
-        headers={'Cache-Control': 'max-age=3600'}
-    )
-
-
-async def serve_particles_js(request):
-    return web.Response(
-        text=PARTICLES_JS,
-        content_type='application/javascript'
-    )
 
 
 @server.controller.add("on_server_bind")
 def on_bind(wslink_server):
     wslink_server.app.router.add_get("/tiles/{z}/{x}/{y}.png", serve_tile)
     wslink_server.app.router.add_get("/borders/{z}/{x}/{y}.png", serve_border_tile)
-    wslink_server.app.router.add_get("/wind_field.json", serve_wind_field)
-    wslink_server.app.router.add_get("/particles.js", serve_particles_js)
 
 
-# ============ PARTICLE ANIMATION JS ============
+# ============ TRAME MODULE: PARTICLE ANIMATION ============
+# Register www/ as a trame module — serves static files and auto-loads particles.js
 
-PARTICLES_JS = """
-(function() {
-    'use strict';
-
-    // === CONFIG ===
-    var NUM_PARTICLES = 1500;
-    var MAX_AGE = 80;
-    var FADE_ALPHA = 0.95;
-    var LINE_WIDTH = 3.0;
-    var LINE_ALPHA = 0.6;
-    var SPEED_MAX_PX = 1.5;
-    var MAX_WIND = 35;
-
-    // === STATE ===
-    var canvas, ctx, trailCanvas, trailCtx;
-    var particles = [];
-    var windField = null;
-    var mapState = null;
-    var animating = false;
-    var moveTimer = null;
-    var animFrame = null;
-    var container = null;
-
-    // === INIT ===
-    function init() {
-        container = document.querySelector('.leaflet-container');
-        if (!container) { setTimeout(init, 500); return; }
-
-        fetch('/wind_field.json')
-            .then(function(r) { return r.json(); })
-            .then(function(data) {
-                windField = data;
-                createCanvas();
-                attachListeners();
-                startAnimation();
-            });
+server.enable_module(
+    {
+        "serve": {"__wind": str(os.path.abspath("www"))},
+        "scripts": ["__wind/particles.js"],
     }
-
-    function createCanvas() {
-        var dpr = window.devicePixelRatio || 1;
-        var w = container.clientWidth;
-        var h = container.clientHeight;
-
-        canvas = document.createElement('canvas');
-        canvas.id = 'wind-particles';
-        canvas.style.cssText = 'position:absolute;top:0;left:0;pointer-events:none;z-index:450;';
-        canvas.style.width = w + 'px';
-        canvas.style.height = h + 'px';
-        canvas.width = w * dpr;
-        canvas.height = h * dpr;
-        container.appendChild(canvas);
-        ctx = canvas.getContext('2d');
-        ctx.scale(dpr, dpr);
-
-        trailCanvas = document.createElement('canvas');
-        trailCanvas.width = w * dpr;
-        trailCanvas.height = h * dpr;
-        trailCtx = trailCanvas.getContext('2d');
-        trailCtx.scale(dpr, dpr);
-    }
-
-    function resizeCanvas() {
-        if (!canvas || !container) return;
-        var dpr = window.devicePixelRatio || 1;
-        var w = container.clientWidth;
-        var h = container.clientHeight;
-        canvas.style.width = w + 'px';
-        canvas.style.height = h + 'px';
-        canvas.width = w * dpr;
-        canvas.height = h * dpr;
-        ctx.scale(dpr, dpr);
-        trailCanvas.width = w * dpr;
-        trailCanvas.height = h * dpr;
-        trailCtx.scale(dpr, dpr);
-    }
-
-    // === LISTENERS ===
-    function attachListeners() {
-        container.addEventListener('mousedown', onMoveStart, true);
-        container.addEventListener('touchstart', onMoveStart, true);
-        container.addEventListener('wheel', function() {
-            onMoveStart();
-            clearTimeout(moveTimer);
-            moveTimer = setTimeout(onMoveEnd, 600);
-        }, true);
-        document.addEventListener('mouseup', onMoveEnd, true);
-        document.addEventListener('touchend', onMoveEnd, true);
-        window.addEventListener('resize', function() {
-            resizeCanvas();
-            onMoveStart();
-            clearTimeout(moveTimer);
-            moveTimer = setTimeout(onMoveEnd, 500);
-        });
-    }
-
-    function onMoveStart() {
-        animating = false;
-        if (animFrame) { cancelAnimationFrame(animFrame); animFrame = null; }
-        if (ctx && container) {
-            var w = container.clientWidth;
-            var h = container.clientHeight;
-            ctx.clearRect(0, 0, w, h);
-            trailCtx.clearRect(0, 0, w, h);
-        }
-    }
-
-    function onMoveEnd() {
-        clearTimeout(moveTimer);
-        moveTimer = setTimeout(function() {
-            startAnimation();
-        }, 400);
-    }
-
-    // === MAP PROJECTION ===
-    function updateMapState() {
-        var tiles = container.querySelectorAll('.leaflet-tile');
-        var cr = container.getBoundingClientRect();
-        for (var i = 0; i < tiles.length; i++) {
-            var src = tiles[i].src || '';
-            var m = src.match(/\\/tiles\\/(\\d+)\\/(\\d+)\\/(\\d+)\\.png/);
-            if (!m) continue;
-            var rect = tiles[i].getBoundingClientRect();
-            if (rect.width < 10) continue;
-            mapState = {
-                n: Math.pow(2, parseInt(m[1])),
-                zoom: parseInt(m[1]),
-                tw: rect.width,
-                rtx: parseInt(m[2]),
-                rty: parseInt(m[3]),
-                rpx: rect.left - cr.left,
-                rpy: rect.top - cr.top
-            };
-            return true;
-        }
-        return false;
-    }
-
-    function pixelToLatLon(px, py) {
-        var s = mapState;
-        var tx = s.rtx + (px - s.rpx) / s.tw;
-        var ty = s.rty + (py - s.rpy) / s.tw;
-        var lon = tx / s.n * 360 - 180;
-        var lat = Math.atan(Math.sinh(Math.PI * (1 - 2 * ty / s.n))) * 180 / Math.PI;
-        return [lat, lon];
-    }
-
-    // === WIND LOOKUP ===
-    function getWind(lat, lon) {
-        if (!windField) return [0, 0];
-        while (lon > 180) lon -= 360;
-        while (lon < -180) lon += 360;
-
-        var li = (windField.lat_max - lat) / windField.lat_step;
-        var lj = (lon - windField.lon_min) / windField.lon_step;
-        var i0 = Math.floor(li), j0 = Math.floor(lj);
-        var i1 = i0 + 1, j1 = j0 + 1;
-
-        if (i0 < 0 || i1 >= windField.n_lats || j0 < 0 || j1 >= windField.n_lons)
-            return [0, 0];
-
-        var fi = li - i0, fj = lj - j0;
-        var nl = windField.n_lons;
-        var u = windField.u, v = windField.v;
-
-        var ui = u[i0*nl+j0]*(1-fi)*(1-fj) + u[i0*nl+j1]*(1-fi)*fj
-               + u[i1*nl+j0]*fi*(1-fj) + u[i1*nl+j1]*fi*fj;
-        var vi = v[i0*nl+j0]*(1-fi)*(1-fj) + v[i0*nl+j1]*(1-fi)*fj
-               + v[i1*nl+j0]*fi*(1-fj) + v[i1*nl+j1]*fi*fj;
-
-        return [ui, vi];
-    }
-
-    // === PARTICLES ===
-    function spawnParticle() {
-        var w = container.clientWidth, h = container.clientHeight;
-        return {
-            x: Math.random() * w,
-            y: Math.random() * h,
-            age: Math.floor(Math.random() * MAX_AGE),
-            maxAge: MAX_AGE + Math.floor(Math.random() * 20)
-        };
-    }
-
-    function startAnimation() {
-        if (!updateMapState()) {
-            setTimeout(startAnimation, 500);
-            return;
-        }
-        particles = [];
-        for (var i = 0; i < NUM_PARTICLES; i++) particles.push(spawnParticle());
-
-        var w = container.clientWidth, h = container.clientHeight;
-        ctx.clearRect(0, 0, w, h);
-        trailCtx.clearRect(0, 0, w, h);
-        animating = true;
-        animate();
-    }
-
-    function animate() {
-        if (!animating) return;
-
-        var w = container.clientWidth, h = container.clientHeight;
-        var speedScale = SPEED_MAX_PX / MAX_WIND * Math.pow(2, mapState.zoom - 3);
-
-        // Fade trails
-        trailCtx.clearRect(0, 0, w, h);
-        trailCtx.drawImage(canvas, 0, 0, w, h);
-        ctx.clearRect(0, 0, w, h);
-        ctx.globalAlpha = FADE_ALPHA;
-        ctx.drawImage(trailCanvas, 0, 0, w, h);
-        ctx.globalAlpha = 1.0;
-
-        // Draw new segments
-        ctx.beginPath();
-        ctx.strokeStyle = 'rgba(255,255,255,' + LINE_ALPHA + ')';
-        ctx.lineWidth = LINE_WIDTH;
-
-        for (var i = 0; i < particles.length; i++) {
-            var p = particles[i];
-            var ll = pixelToLatLon(p.x, p.y);
-            if (!ll) { particles[i] = spawnParticle(); continue; }
-
-            var wind = getWind(ll[0], ll[1]);
-            var dx = wind[0] * speedScale;
-            var dy = -wind[1] * speedScale;
-
-            if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) { p.age++; }
-            else {
-                var nx = p.x + dx, ny = p.y + dy;
-                ctx.moveTo(p.x, p.y);
-                ctx.lineTo(nx, ny);
-                p.x = nx;
-                p.y = ny;
-            }
-
-            p.age++;
-            if (p.age > p.maxAge || p.x < -10 || p.x > w+10 || p.y < -10 || p.y > h+10) {
-                particles[i] = spawnParticle();
-            }
-        }
-        ctx.stroke();
-        animFrame = requestAnimationFrame(animate);
-    }
-
-    // Start
-    init();
-})();
-"""
+)
 
 
 # ============ UI LAYOUT ============
@@ -471,18 +225,28 @@ with SinglePageLayout(server) as layout:
             """
         )
 
+        # Trame-native state watchers for particle control
+        client.ClientStateChange(
+            value="particle_active",
+            change="""
+                if (window._windParticles && window._windParticles.isReady()) {
+                    value ? window._windParticles.start() : window._windParticles.stop();
+                }
+            """,
+        )
+        client.ClientStateChange(
+            value="particle_count",
+            change="""
+                if (window._windParticles) {
+                    window._windParticles.setCount(value);
+                }
+            """,
+        )
+
         with v3.VContainer(
             fluid=True,
             classes="fill-height pa-0",
             style="position: relative;",
-            mouseenter=(
-                "if(!window._pLoaded){"
-                "window._pLoaded=true;"
-                "window.setTimeout(function(){"
-                "var s=window.document.createElement('script');"
-                "s.src='/particles.js';"
-                "window.document.head.appendChild(s);},1000);}"
-            ),
             mousemove=MOUSEMOVE_JS,
             mouseleave="mouse_data = null; tooltip_visible = false",
         ):
