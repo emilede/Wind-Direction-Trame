@@ -27,7 +27,7 @@ MAX_AGE = 80
 SPEED_SCALE = 0.6
 MAX_WIND = 35
 TRAIL_LENGTH = 6
-LINE_WIDTH = 2.0
+LINE_WIDTH = 3.0
 
 # ============ LOAD + COMPOSITE TILES ============
 
@@ -174,15 +174,15 @@ class ParticleSystem:
         self.age[:] = np.random.randint(0, MAX_AGE, self.n)
         self.trails.clear()
 
-    def step(self):
+    def step(self, speed_factor=1.0):
         prev_x = self.x.copy()
         prev_y = self.y.copy()
 
         lats, lons = pixel_to_latlon_vec(self.x, self.y)
         u, v = get_wind_vec(lats, lons)
 
-        dx = u * SPEED_SCALE
-        dy = v * SPEED_SCALE
+        dx = u * SPEED_SCALE * speed_factor
+        dy = v * SPEED_SCALE * speed_factor
         moved = (np.abs(dx) > 0.01) | (np.abs(dy) > 0.01)
 
         self.x += dx
@@ -318,6 +318,9 @@ style.AddObserver("LeftButtonReleaseEvent", _left_up)
 
 # ============ CAMERA BOUNDS ============
 
+INITIAL_PARALLEL_SCALE = IMG_H / 2
+
+
 def get_camera_bounds():
     """Get visible pixel bounds (x0, x1, y0, y1) from the orthographic camera."""
     fp = cam.GetFocalPoint()
@@ -327,6 +330,11 @@ def get_camera_bounds():
     half_h = ps
     half_w = ps * aspect
     return (fp[0] - half_w, fp[0] + half_w, fp[1] - half_h, fp[1] + half_h)
+
+
+def get_zoom_factor():
+    """How much we're zoomed in relative to initial view. 1.0 = no zoom, 2.0 = 2x zoom."""
+    return INITIAL_PARALLEL_SCALE / max(cam.GetParallelScale(), 1)
 
 
 # ============ INTERACTION STATE ============
@@ -391,7 +399,9 @@ def on_timer(obj, event):
     current_bounds = get_camera_bounds()
     particles.set_bounds(current_bounds)
 
-    particles.step()
+    # Scale speed inversely with zoom so particles don't fly across screen
+    zoom = get_zoom_factor()
+    particles.step(speed_factor=1.0 / zoom)
     polydata = particles.build_polydata()
     particle_mapper.SetInputData(polydata)
     window.Render()
