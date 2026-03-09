@@ -30,16 +30,18 @@ LINE_WIDTH = 2.0
 
 # ============ LOAD + COMPOSITE TILES ============
 
-print("Compositing tiles...")
-t0 = time.perf_counter()
+print("Loading tiles from disk...")
+t_tile_start = time.perf_counter()
 
 bg = Image.new('RGB', (IMG_W, IMG_H), (26, 17, 40))
+tiles_loaded = 0
 for x in range(NUM_TILES):
     for y in range(NUM_TILES):
         path = f"data/tiles/{ZOOM}/{x}/{y}.png"
         if os.path.exists(path):
             tile = Image.open(path)
             bg.paste(tile, (x * TILE_SIZE, y * TILE_SIZE))
+            tiles_loaded += 1
 
 for x in range(NUM_TILES):
     for y in range(NUM_TILES):
@@ -47,8 +49,11 @@ for x in range(NUM_TILES):
         if os.path.exists(path):
             border = Image.open(path).convert('RGBA')
             bg.paste(border, (x * TILE_SIZE, y * TILE_SIZE), border)
+            tiles_loaded += 1
 
-print(f"Tiles composited in {time.perf_counter() - t0:.2f}s")
+t_tile_end = time.perf_counter()
+tile_load_time = t_tile_end - t_tile_start
+print(f"Loaded {tiles_loaded} tiles in {tile_load_time:.2f}s")
 
 # Convert PIL image to vtkImageData
 # PIL is top-left origin, VTK is bottom-left origin — flip vertically
@@ -316,17 +321,30 @@ print(f"\nStarting VTK benchmark: {NUM_PARTICLES} particles, {TRAIL_LENGTH} trai
 print("Close the window to see final stats.\n")
 
 interactor.Initialize()
+
+t_first_render = time.perf_counter()
 window.Render()
+first_render_time = time.perf_counter() - t_first_render
+
+print(f"First render: {first_render_time * 1000:.0f}ms")
+
 interactor.Start()
 
 # ============ FINAL STATS ============
 elapsed = time.perf_counter() - fps_start
 if total_frames > 0:
-    print(f"\n=== BENCHMARK RESULTS ===")
-    print(f"Total frames: {total_frames}")
-    print(f"Total time: {elapsed:.1f}s")
-    print(f"Average FPS: {total_frames / elapsed:.1f}")
-    print(f"Avg frame time: {np.mean(frame_times) * 1000:.1f}ms")
-    print(f"Min frame time: {np.min(frame_times) * 1000:.1f}ms")
-    print(f"Max frame time: {np.max(frame_times) * 1000:.1f}ms")
-    print(f"P95 frame time: {np.percentile(frame_times, 95) * 1000:.1f}ms")
+    print(f"\n{'='*50}")
+    print(f"  VTK STANDALONE BENCHMARK RESULTS")
+    print(f"{'='*50}")
+    print(f"  Tile loading:     {tile_load_time:.2f}s ({tiles_loaded} tiles from disk)")
+    print(f"  First render:     {first_render_time * 1000:.0f}ms")
+    print(f"  Time to visible:  {tile_load_time + first_render_time:.2f}s")
+    print(f"{'='*50}")
+    print(f"  Animation FPS:    {total_frames / elapsed:.1f} avg")
+    print(f"  Total frames:     {total_frames}")
+    print(f"  Total time:       {elapsed:.1f}s")
+    print(f"  Avg frame time:   {np.mean(frame_times) * 1000:.1f}ms")
+    print(f"  Min frame time:   {np.min(frame_times) * 1000:.1f}ms")
+    print(f"  Max frame time:   {np.max(frame_times) * 1000:.1f}ms")
+    print(f"  P95 frame time:   {np.percentile(frame_times, 95) * 1000:.1f}ms")
+    print(f"{'='*50}")
