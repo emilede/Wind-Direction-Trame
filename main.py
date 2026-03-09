@@ -33,7 +33,7 @@ MAX_AGE = 80
 SPEED_SCALE = 0.6
 MAX_WIND = 35
 TRAIL_LENGTH = 6
-LINE_WIDTH = 2.0
+LINE_WIDTH = 3.0
 TARGET_FPS = 20
 FRAME_INTERVAL = 1.0 / TARGET_FPS
 
@@ -50,27 +50,36 @@ state.fps_text = "FPS: --"
 print("Compositing tiles...")
 t0 = time.perf_counter()
 
-bg = Image.new('RGB', (IMG_W, IMG_H), (26, 17, 40))
+# Build single-copy first, then tile 3x wide for horizontal wrapping
+bg_single = Image.new('RGB', (IMG_W, IMG_H), (26, 17, 40))
 for x in range(NUM_TILES):
     for y in range(NUM_TILES):
         path = f"data/tiles/{ZOOM}/{x}/{y}.png"
         if os.path.exists(path):
             tile = Image.open(path)
-            bg.paste(tile, (x * TILE_SIZE, y * TILE_SIZE))
+            bg_single.paste(tile, (x * TILE_SIZE, y * TILE_SIZE))
 
 for x in range(NUM_TILES):
     for y in range(NUM_TILES):
         path = f"data/border_tiles/{ZOOM}/{x}/{y}.png"
         if os.path.exists(path):
             border = Image.open(path).convert('RGBA')
-            bg.paste(border, (x * TILE_SIZE, y * TILE_SIZE), border)
+            bg_single.paste(border, (x * TILE_SIZE, y * TILE_SIZE), border)
+
+# 3 copies side-by-side for seamless horizontal wrapping
+WRAP_W = IMG_W * 3
+bg = Image.new('RGB', (WRAP_W, IMG_H), (26, 17, 40))
+bg.paste(bg_single, (0, 0))
+bg.paste(bg_single, (IMG_W, 0))
+bg.paste(bg_single, (IMG_W * 2, 0))
+del bg_single
 
 print(f"Tiles composited in {time.perf_counter() - t0:.2f}s")
 
 # Convert to vtkImageData (flip for VTK's bottom-left origin)
 bg_arr = np.flipud(np.array(bg))
 bg_vtk = vtk.vtkImageData()
-bg_vtk.SetDimensions(IMG_W, IMG_H, 1)
+bg_vtk.SetDimensions(WRAP_W, IMG_H, 1)
 bg_vtk.SetSpacing(1.0, 1.0, 1.0)
 bg_vtk.SetOrigin(0.0, 0.0, 0.0)
 vtk_arr = numpy_to_vtk(bg_arr.reshape(-1, 3), deep=True)
@@ -111,8 +120,8 @@ print(f"Wind field: {N_LATS}x{N_LONS}")
 # ============ VECTORIZED PARTICLE SYSTEM ============
 
 def pixel_to_latlon_vec(px, py):
-    """Vectorized pixel → lat/lon conversion."""
-    tx = px / TILE_SIZE
+    """Vectorized pixel → lat/lon conversion (wraps horizontally)."""
+    tx = (px % IMG_W) / TILE_SIZE
     ty = NUM_TILES - (py / TILE_SIZE)
     lon = tx / NUM_TILES * 360 - 180
     lat = np.arctan(np.sinh(np.pi * (1 - 2 * ty / NUM_TILES))) * 180 / np.pi
@@ -186,15 +195,15 @@ class ParticleSystem:
         self.age[:] = np.random.randint(0, MAX_AGE, self.n)
         self.trails.clear()
 
-    def step(self):
+    def step(self, speed_factor=1.0):
         prev_x = self.x.copy()
         prev_y = self.y.copy()
 
         lats, lons = pixel_to_latlon_vec(self.x, self.y)
         u, v = get_wind_vec(lats, lons)
 
-        dx = u * SPEED_SCALE
-        dy = v * SPEED_SCALE
+        dx = u * SPEED_SCALE * speed_factor
+        dy = v * SPEED_SCALE * speed_factor
         moved = (np.abs(dx) > 0.01) | (np.abs(dy) > 0.01)
 
         self.x += dx
@@ -299,9 +308,10 @@ renderer.AddActor(particle_actor)
 # Camera — orthographic, framing the full tile image
 cam = renderer.GetActiveCamera()
 cam.ParallelProjectionOn()
-cam.SetPosition(IMG_W / 2, IMG_H / 2, 1000)
-cam.SetFocalPoint(IMG_W / 2, IMG_H / 2, 0)
+cam.SetPosition(WRAP_W / 2, IMG_H / 2, 1000)
+cam.SetFocalPoint(WRAP_W / 2, IMG_H / 2, 0)
 cam.SetParallelScale(IMG_H / 2)
+INITIAL_PARALLEL_SCALE = IMG_H / 2
 
 # Render window
 render_window = vtk.vtkRenderWindow()
@@ -322,6 +332,43 @@ def _left_up(obj, event):
 
 style.AddObserver("LeftButtonPressEvent", _left_down)
 style.AddObserver("LeftButtonReleaseEvent", _left_up)
+
+# Clamp camera: wrap horizontally, clamp vertically and zoom
+MIN_PARALLEL_SCALE = IMG_H / 16  # max zoom-in (~4x)
+_clamping = False
+
+def clamp_camera(obj=None, event=None):
+    global _clamping
+    if _clamping:
+        return
+    _clamping = True
+
+    ps = cam.GetParallelScale()
+    # Max zoom-out: viewport width must not exceed one earth width (IMG_W)
+    win_size = render_window.GetSize()
+    aspect = win_size[0] / max(win_size[1], 1)
+    max_ps = IMG_W / (2 * aspect)  # parallel scale where viewport width == IMG_W
+    ps = max(MIN_PARALLEL_SCALE, min(ps, max_ps))
+    cam.SetParallelScale(ps)
+
+    half_h = ps
+    fp = list(cam.GetFocalPoint())
+
+    # Horizontal wrapping: keep focal point within middle copy
+    while fp[0] < IMG_W * 0.5:
+        fp[0] += IMG_W
+    while fp[0] > IMG_W * 2.5:
+        fp[0] -= IMG_W
+
+    # Vertical clamping: no wrapping
+    fp[1] = max(half_h, min(fp[1], IMG_H - half_h))
+
+    cam.SetFocalPoint(fp[0], fp[1], fp[2])
+    cam.SetPosition(fp[0], fp[1], 1000)
+
+    _clamping = False
+
+cam.AddObserver("ModifiedEvent", clamp_camera)
 
 # Warmup render — initializes GL context before trame connects
 render_window.Render()
@@ -400,7 +447,8 @@ async def animate():
             bounds = get_camera_bounds()
             particles.set_bounds(bounds)
 
-            particles.step()
+            zoom = INITIAL_PARALLEL_SCALE / max(cam.GetParallelScale(), 1)
+            particles.step(speed_factor=1.0 / zoom)
             polydata = particles.build_polydata()
             particle_mapper.SetInputData(polydata)
             particle_mapper.Update()
