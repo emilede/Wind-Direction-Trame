@@ -10,6 +10,7 @@ import os
 import json
 import time
 import asyncio
+import resource
 import numpy as np
 from PIL import Image
 import vtk
@@ -19,6 +20,8 @@ from trame.app import get_server
 from trame.ui.vuetify3 import SinglePageLayout
 from trame.widgets import vuetify3 as v3, html as html_widgets
 from trame.widgets import vtk as vtk_widgets
+
+_app_start = time.perf_counter()
 
 # ============ CONFIG ============
 
@@ -418,6 +421,7 @@ def on_interaction_start(obj=None, event=None):
 def on_interaction_end(obj=None, event=None):
     """Respawn particles after a brief delay when interaction stops."""
     global interaction_timer
+    _interaction_end_time = time.perf_counter()
 
     async def respawn():
         await asyncio.sleep(0.4)
@@ -428,6 +432,8 @@ def on_interaction_end(obj=None, event=None):
         particles.respawn_all()
         particle_actor.VisibilityOn()
         animating = True
+        respawn_ms = (time.perf_counter() - _interaction_end_time) * 1000
+        print(f"BENCHMARK: Respawn delay: {respawn_ms:.0f}ms")
 
     interaction_timer = asyncio.ensure_future(respawn())
 
@@ -446,8 +452,7 @@ async def animate():
     particles.respawn_all()
 
     while True:
-        t0 = time.perf_counter()
-
+        frame_start = time.perf_counter()
         if animating:
             # Update bounds from camera each frame (in case of slow drift)
             bounds = get_camera_bounds()
@@ -469,13 +474,18 @@ async def animate():
                 frame_count = 0
                 last_report = now
 
-        elapsed = time.perf_counter() - t0
-        sleep_time = max(0.001, FRAME_INTERVAL - elapsed)
-        await asyncio.sleep(sleep_time)
+        elapsed = time.perf_counter() - frame_start
+        await asyncio.sleep(max(0.001, FRAME_INTERVAL - elapsed))
 
 
 @ctrl.add("on_server_ready")
 def on_ready(**kwargs):
+    startup_time = time.perf_counter() - _app_start
+    mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+    print(f"\n{'='*50}")
+    print(f"BENCHMARK: Startup time: {startup_time:.2f}s")
+    print(f"BENCHMARK: Peak memory: {mem_mb:.1f} MB")
+    print(f"{'='*50}\n")
     asyncio.ensure_future(animate())
 
 
