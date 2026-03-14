@@ -9,10 +9,13 @@ Prints FPS metrics for comparison with the trame version.
 import os
 import json
 import time
+import resource
 import numpy as np
 from PIL import Image
 import vtk
 from vtk.util.numpy_support import numpy_to_vtk
+
+_app_start = time.perf_counter()
 
 # ============ CONFIG ============
 
@@ -383,6 +386,8 @@ def on_timer(obj, event):
     # Check for delayed respawn after interaction
     if interaction_end_time is not None:
         if time.perf_counter() - interaction_end_time >= RESPAWN_DELAY:
+            delay_ms = (time.perf_counter() - interaction_end_time) * 1000
+            print(f"BENCHMARK: Respawn delay: {delay_ms:.0f}ms")
             interaction_end_time = None
             new_bounds = get_camera_bounds()
             particles.set_bounds(new_bounds)
@@ -434,6 +439,13 @@ window.Render()
 first_render_time = time.perf_counter() - t_first_render
 
 print(f"First render: {first_render_time * 1000:.0f}ms")
+
+startup_time = time.perf_counter() - _app_start
+mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+print(f"\n{'='*50}")
+print(f"BENCHMARK: Startup time: {startup_time:.2f}s")
+print(f"BENCHMARK: Peak memory: {mem_mb:.1f} MB")
+print(f"{'='*50}\n")
 
 interactor.Start()
 
