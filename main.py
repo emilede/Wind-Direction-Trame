@@ -11,6 +11,7 @@ import os
 import json
 import time
 import math
+import resource
 import numpy as np
 from aiohttp import web
 from trame.app import get_server
@@ -19,6 +20,7 @@ from trame.widgets import vuetify3 as v3, leaflet3 as leaflet, html as html_widg
 from trame.widgets import client
 
 CACHE_BUST = int(time.time())
+_app_start = time.perf_counter()
 
 server = get_server(client_type="vue3")
 state = server.state
@@ -327,6 +329,15 @@ with SinglePageLayout(server) as layout:
                             val,
                             style="color:white; font-size:10px; padding:0; text-align:center; min-width:0;",
                         )
+
+@server.controller.add("on_server_ready")
+def on_ready(**kwargs):
+    startup_time = time.perf_counter() - _app_start
+    mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+    print(f"\n{'='*50}")
+    print(f"BENCHMARK: Startup time: {startup_time:.2f}s")
+    print(f"BENCHMARK: Peak memory: {mem_mb:.1f} MB")
+    print(f"{'='*50}\n")
 
 if __name__ == "__main__":
     server.start()

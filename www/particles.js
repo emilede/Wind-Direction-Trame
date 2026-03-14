@@ -24,6 +24,10 @@
   var animFrame = null;
   var container = null;
   var numParticles = 1500;
+  var fpsFrameCount = 0;
+  var fpsLastTime = performance.now();
+  var interactionEndTime = null;
+  var measureRespawn = false;
 
   // === INIT ===
   function init() {
@@ -127,6 +131,8 @@
 
   function onMoveEnd() {
     clearTimeout(moveTimer);
+    interactionEndTime = performance.now();
+    measureRespawn = true;
     moveTimer = setTimeout(function () {
       startAnimation();
     }, 400);
@@ -247,6 +253,12 @@
   function animate() {
     if (!animating) return;
 
+    if (measureRespawn && interactionEndTime) {
+      var respawnMs = performance.now() - interactionEndTime;
+      console.log("BENCHMARK: Respawn delay: " + respawnMs.toFixed(0) + "ms");
+      measureRespawn = false;
+    }
+
     var w = container.clientWidth,
       h = container.clientHeight;
     var speedScale =
@@ -300,6 +312,17 @@
       }
     }
     ctx.stroke();
+
+    // FPS measurement
+    fpsFrameCount++;
+    var now = performance.now();
+    if (now - fpsLastTime >= 2000) {
+      var fps = (fpsFrameCount * 1000) / (now - fpsLastTime);
+      console.log("BENCHMARK: Animation FPS: " + fps.toFixed(1));
+      fpsFrameCount = 0;
+      fpsLastTime = now;
+    }
+
     animFrame = requestAnimationFrame(animate);
   }
 
