@@ -28,61 +28,69 @@ state.trame__title = "Wind Speed"
 
 # ============ WIND DATA LOOKUP + WIND FIELD ============
 
-print("Loading wind data...")
-with open('data/wind_data.json') as f:
-    wind_data = json.load(f)
-
-# Tooltip lookup grid (0.5° resolution)
 LOOKUP_STEP = 0.5
-lookup_grid = {}
-
-# Wind field for particle animation (1° resolution)
 FIELD_STEP = 1.0
-field_u = {}
-field_v = {}
-
-for p in wind_data:
-    # Tooltip
-    lat_key = round(round(p['lat'] / LOOKUP_STEP) * LOOKUP_STEP, 1)
-    lon_key = round(round(p['lon'] / LOOKUP_STEP) * LOOKUP_STEP, 1)
-    key = (lat_key, lon_key)
-    if key not in lookup_grid:
-        lookup_grid[key] = (round(p['speed'], 1), round(p['direction']))
-
-    # Wind field
-    flat = float(int(round(p['lat'] / FIELD_STEP))) * FIELD_STEP
-    flon = float(int(round(p['lon'] / FIELD_STEP))) * FIELD_STEP
-    fkey = (flat, flon)
-    if fkey not in field_u:
-        field_u[fkey] = round(p['u'], 2)
-        field_v[fkey] = round(p['v'], 2)
-
-print(f"Tooltip grid: {len(lookup_grid)} points")
-print(f"Wind field grid: {len(field_u)} points")
-
-# Build wind field JSON and write to www/ for trame module serving
-u_arr = []
-v_arr = []
-for lat_i in range(90, -91, -1):
-    for lon_i in range(-180, 181, 1):
-        key = (float(lat_i), float(lon_i))
-        u_arr.append(field_u.get(key, 0.0))
-        v_arr.append(field_v.get(key, 0.0))
-
-wind_field_json = json.dumps({
-    'lat_min': -90, 'lat_max': 90, 'lat_step': 1.0,
-    'lon_min': -180, 'lon_max': 180, 'lon_step': 1.0,
-    'n_lats': 181, 'n_lons': 361,
-    'u': u_arr, 'v': v_arr
-})
+LOOKUP_CACHE = 'data/lookup_cache.json'
+WIND_FIELD_OUT = 'www/wind_field.json'
 
 os.makedirs('www', exist_ok=True)
-with open('www/wind_field.json', 'w') as f:
-    f.write(wind_field_json)
 
-print(f"Wind field JSON: {len(wind_field_json) / 1024:.0f} KB → www/wind_field.json")
+if os.path.exists(LOOKUP_CACHE) and os.path.exists(WIND_FIELD_OUT):
+    print("Loading pre-generated wind cache...")
+    with open(LOOKUP_CACHE) as f:
+        raw = json.load(f)
+    lookup_grid = {tuple(float(x) for x in k.split(',')): v for k, v in raw.items()}
+    print(f"Tooltip grid: {len(lookup_grid)} points (from cache)")
+else:
+    print("First run: processing wind_data.json (this takes a while)...")
+    with open('data/wind_data.json') as f:
+        wind_data = json.load(f)
 
-del wind_data, field_u, field_v, u_arr, v_arr, wind_field_json
+    lookup_grid = {}
+    field_u = {}
+    field_v = {}
+
+    for p in wind_data:
+        lat_key = round(round(p['lat'] / LOOKUP_STEP) * LOOKUP_STEP, 1)
+        lon_key = round(round(p['lon'] / LOOKUP_STEP) * LOOKUP_STEP, 1)
+        key = (lat_key, lon_key)
+        if key not in lookup_grid:
+            lookup_grid[key] = (round(p['speed'], 1), round(p['direction']))
+
+        flat = float(int(round(p['lat'] / FIELD_STEP))) * FIELD_STEP
+        flon = float(int(round(p['lon'] / FIELD_STEP))) * FIELD_STEP
+        fkey = (flat, flon)
+        if fkey not in field_u:
+            field_u[fkey] = round(p['u'], 2)
+            field_v[fkey] = round(p['v'], 2)
+
+    print(f"Tooltip grid: {len(lookup_grid)} points")
+
+    # Save lookup cache
+    with open(LOOKUP_CACHE, 'w') as f:
+        json.dump({f"{k[0]},{k[1]}": list(v) for k, v in lookup_grid.items()}, f)
+    print(f"Saved {LOOKUP_CACHE}")
+
+    # Build and save wind field JSON
+    u_arr = []
+    v_arr = []
+    for lat_i in range(90, -91, -1):
+        for lon_i in range(-180, 181, 1):
+            key = (float(lat_i), float(lon_i))
+            u_arr.append(field_u.get(key, 0.0))
+            v_arr.append(field_v.get(key, 0.0))
+
+    wind_field_json = json.dumps({
+        'lat_min': -90, 'lat_max': 90, 'lat_step': 1.0,
+        'lon_min': -180, 'lon_max': 180, 'lon_step': 1.0,
+        'n_lats': 181, 'n_lons': 361,
+        'u': u_arr, 'v': v_arr
+    })
+    with open(WIND_FIELD_OUT, 'w') as f:
+        f.write(wind_field_json)
+    print(f"Wind field JSON: {len(wind_field_json) / 1024:.0f} KB → {WIND_FIELD_OUT}")
+
+    del wind_data, field_u, field_v, u_arr, v_arr, wind_field_json
 
 COMPASS = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
            'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
