@@ -22,6 +22,8 @@ from trame.widgets import vuetify3 as v3, html as html_widgets
 from trame.widgets import vtk as vtk_widgets
 
 _app_start = time.perf_counter()
+_t_imports = time.perf_counter()
+print(f"BENCHMARK: Imports: {(_t_imports - _app_start)*1000:.1f}ms")
 
 # ============ CONFIG ============
 
@@ -48,9 +50,10 @@ ctrl = server.controller
 state.trame__title = "Wind Speed — VTK"
 state.fps_text = "FPS: --"
 
-# ============ LOAD + COMPOSITE TILES ============
+_t_pipeline = time.perf_counter()
+print(f"BENCHMARK: Pipeline setup: {(_t_pipeline - _app_start)*1000:.1f}ms")
 
-print("Compositing tiles...")
+# ============ LOAD + COMPOSITE TILES ============
 t0 = time.perf_counter()
 
 # Build single-copy first, then tile 3x wide for horizontal wrapping
@@ -77,7 +80,8 @@ bg.paste(bg_single, (IMG_W, 0))
 bg.paste(bg_single, (IMG_W * 2, 0))
 del bg_single
 
-print(f"Tiles composited in {time.perf_counter() - t0:.2f}s")
+_t_tiles = time.perf_counter()
+print(f"BENCHMARK: Tiles composited: {(_t_tiles - _app_start)*1000:.1f}ms")
 
 # Convert to vtkImageData (flip for VTK's bottom-left origin)
 bg_arr = np.flipud(np.array(bg))
@@ -91,33 +95,41 @@ bg_vtk.GetPointData().SetScalars(vtk_arr)
 
 # ============ LOAD WIND DATA ============
 
-print("Loading wind data...")
-with open('data/wind_data.json') as f:
-    wind_data = json.load(f)
-
 FIELD_STEP = 1.0
-field_u = {}
-field_v = {}
-for p in wind_data:
-    flat = float(int(round(p['lat'] / FIELD_STEP))) * FIELD_STEP
-    flon = float(int(round(p['lon'] / FIELD_STEP))) * FIELD_STEP
-    fkey = (flat, flon)
-    if fkey not in field_u:
-        field_u[fkey] = p['u']
-        field_v[fkey] = p['v']
-
 N_LATS = 181
 N_LONS = 361
-u_grid = np.zeros((N_LATS, N_LONS), dtype=np.float32)
-v_grid = np.zeros((N_LATS, N_LONS), dtype=np.float32)
-for i, lat in enumerate(range(90, -91, -1)):
-    for j, lon in enumerate(range(-180, 181, 1)):
-        key = (float(lat), float(lon))
-        u_grid[i, j] = field_u.get(key, 0.0)
-        v_grid[i, j] = field_v.get(key, 0.0)
+WIND_CACHE = 'data/wind_grid_cache.npz'
 
-del wind_data, field_u, field_v
-print(f"Wind field: {N_LATS}x{N_LONS}")
+if os.path.exists(WIND_CACHE):
+    cached = np.load(WIND_CACHE)
+    u_grid = cached['u']
+    v_grid = cached['v']
+else:
+    with open('data/wind_data.json') as f:
+        wind_data = json.load(f)
+
+    field_u = {}
+    field_v = {}
+    for p in wind_data:
+        flat = float(int(round(p['lat'] / FIELD_STEP))) * FIELD_STEP
+        flon = float(int(round(p['lon'] / FIELD_STEP))) * FIELD_STEP
+        fkey = (flat, flon)
+        if fkey not in field_u:
+            field_u[fkey] = p['u']
+            field_v[fkey] = p['v']
+
+    u_grid = np.zeros((N_LATS, N_LONS), dtype=np.float32)
+    v_grid = np.zeros((N_LATS, N_LONS), dtype=np.float32)
+    for i, lat in enumerate(range(90, -91, -1)):
+        for j, lon in enumerate(range(-180, 181, 1)):
+            key = (float(lat), float(lon))
+            u_grid[i, j] = field_u.get(key, 0.0)
+            v_grid[i, j] = field_v.get(key, 0.0)
+
+    np.savez(WIND_CACHE, u=u_grid, v=v_grid)
+    del wind_data, field_u, field_v
+_t_data = time.perf_counter()
+print(f"BENCHMARK: Data loaded: {(_t_data - _app_start)*1000:.1f}ms")
 
 
 # ============ VECTORIZED PARTICLE SYSTEM ============
@@ -289,7 +301,7 @@ class ParticleSystem:
 
 # ============ VTK SCENE ============
 
-print("Setting up VTK scene...")
+# ============ VTK SCENE ============
 
 # Single renderer — both background and particles share a camera
 renderer = vtk.vtkRenderer()
@@ -381,7 +393,8 @@ render_window.AddObserver("ModifiedEvent", on_window_modified)
 
 # Warmup render — initializes GL context before trame connects
 render_window.Render()
-print("Warmup render complete")
+_t_render = time.perf_counter()
+print(f"BENCHMARK: First render: {(_t_render - _app_start)*1000:.1f}ms")
 
 
 def get_camera_bounds():
@@ -480,12 +493,10 @@ async def animate():
 
 @ctrl.add("on_server_ready")
 def on_ready(**kwargs):
-    startup_time = time.perf_counter() - _app_start
+    _t_ready = time.perf_counter()
     mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
-    print(f"\n{'='*50}")
-    print(f"BENCHMARK: Startup time: {startup_time:.2f}s")
+    print(f"BENCHMARK: Server ready: {(_t_ready - _app_start)*1000:.1f}ms")
     print(f"BENCHMARK: Peak memory: {mem_mb:.1f} MB")
-    print(f"{'='*50}\n")
     asyncio.ensure_future(animate())
 
 
