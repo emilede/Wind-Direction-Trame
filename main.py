@@ -19,12 +19,18 @@ from trame.ui.vuetify3 import SinglePageLayout
 from trame.widgets import vuetify3 as v3, leaflet3 as leaflet, html as html_widgets
 from trame.widgets import client
 
-CACHE_BUST = int(time.time())
 _app_start = time.perf_counter()
+_t_imports = time.perf_counter()
+print(f"BENCHMARK: Imports: {(_t_imports - _app_start)*1000:.1f}ms")
+
+CACHE_BUST = int(time.time())
 
 server = get_server(client_type="vue3")
 state = server.state
 state.trame__title = "Wind Speed"
+
+_t_pipeline = time.perf_counter()
+print(f"BENCHMARK: Pipeline setup: {(_t_pipeline - _app_start)*1000:.1f}ms")
 
 # ============ WIND DATA LOOKUP + WIND FIELD ============
 
@@ -36,13 +42,10 @@ WIND_FIELD_OUT = 'www/wind_field.json'
 os.makedirs('www', exist_ok=True)
 
 if os.path.exists(LOOKUP_CACHE) and os.path.exists(WIND_FIELD_OUT):
-    print("Loading pre-generated wind cache...")
     with open(LOOKUP_CACHE) as f:
         raw = json.load(f)
     lookup_grid = {tuple(float(x) for x in k.split(',')): v for k, v in raw.items()}
-    print(f"Tooltip grid: {len(lookup_grid)} points (from cache)")
 else:
-    print("First run: processing wind_data.json (this takes a while)...")
     with open('data/wind_data.json') as f:
         wind_data = json.load(f)
 
@@ -64,14 +67,9 @@ else:
             field_u[fkey] = round(p['u'], 2)
             field_v[fkey] = round(p['v'], 2)
 
-    print(f"Tooltip grid: {len(lookup_grid)} points")
-
-    # Save lookup cache
     with open(LOOKUP_CACHE, 'w') as f:
         json.dump({f"{k[0]},{k[1]}": list(v) for k, v in lookup_grid.items()}, f)
-    print(f"Saved {LOOKUP_CACHE}")
 
-    # Build and save wind field JSON
     u_arr = []
     v_arr = []
     for lat_i in range(90, -91, -1):
@@ -88,9 +86,11 @@ else:
     })
     with open(WIND_FIELD_OUT, 'w') as f:
         f.write(wind_field_json)
-    print(f"Wind field JSON: {len(wind_field_json) / 1024:.0f} KB → {WIND_FIELD_OUT}")
 
     del wind_data, field_u, field_v, u_arr, v_arr, wind_field_json
+
+_t_data = time.perf_counter()
+print(f"BENCHMARK: Data loaded: {(_t_data - _app_start)*1000:.1f}ms")
 
 COMPASS = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
            'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
@@ -340,12 +340,10 @@ with SinglePageLayout(server) as layout:
 
 @server.controller.add("on_server_ready")
 def on_ready(**kwargs):
-    startup_time = time.perf_counter() - _app_start
+    _t_ready = time.perf_counter()
     mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
-    print(f"\n{'='*50}")
-    print(f"BENCHMARK: Startup time: {startup_time:.2f}s")
+    print(f"BENCHMARK: Server ready: {(_t_ready - _app_start)*1000:.1f}ms")
     print(f"BENCHMARK: Peak memory: {mem_mb:.1f} MB")
-    print(f"{'='*50}\n")
 
 if __name__ == "__main__":
     server.start()
