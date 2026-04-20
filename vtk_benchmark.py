@@ -16,6 +16,8 @@ import vtk
 from vtk.util.numpy_support import numpy_to_vtk
 
 _app_start = time.perf_counter()
+_t_imports = time.perf_counter()
+print(f"BENCHMARK: Imports: {(_t_imports - _app_start)*1000:.1f}ms")
 
 # ============ CONFIG ============
 
@@ -33,9 +35,6 @@ TRAIL_LENGTH = 6
 LINE_WIDTH = 3.0
 
 # ============ LOAD + COMPOSITE TILES ============
-
-print("Loading tiles from disk...")
-t_tile_start = time.perf_counter()
 
 bg = Image.new('RGB', (IMG_W, IMG_H), (26, 17, 40))
 tiles_loaded = 0
@@ -55,9 +54,8 @@ for x in range(NUM_TILES):
             bg.paste(border, (x * TILE_SIZE, y * TILE_SIZE), border)
             tiles_loaded += 1
 
-t_tile_end = time.perf_counter()
-tile_load_time = t_tile_end - t_tile_start
-print(f"Loaded {tiles_loaded} tiles in {tile_load_time:.2f}s")
+_t_tiles = time.perf_counter()
+print(f"BENCHMARK: Tiles composited: {(_t_tiles - _app_start)*1000:.1f}ms")
 
 # Convert to vtkImageData (flip for VTK's bottom-left origin)
 bg_arr = np.flipud(np.array(bg))
@@ -71,33 +69,42 @@ bg_vtk.GetPointData().SetScalars(vtk_arr)
 
 # ============ LOAD WIND DATA ============
 
-print("Loading wind data...")
-with open('data/wind_data.json') as f:
-    wind_data = json.load(f)
-
 FIELD_STEP = 1.0
-field_u = {}
-field_v = {}
-for p in wind_data:
-    flat = float(int(round(p['lat'] / FIELD_STEP))) * FIELD_STEP
-    flon = float(int(round(p['lon'] / FIELD_STEP))) * FIELD_STEP
-    fkey = (flat, flon)
-    if fkey not in field_u:
-        field_u[fkey] = p['u']
-        field_v[fkey] = p['v']
-
 N_LATS = 181
 N_LONS = 361
-u_grid = np.zeros((N_LATS, N_LONS), dtype=np.float32)
-v_grid = np.zeros((N_LATS, N_LONS), dtype=np.float32)
-for i, lat in enumerate(range(90, -91, -1)):
-    for j, lon in enumerate(range(-180, 181, 1)):
-        key = (float(lat), float(lon))
-        u_grid[i, j] = field_u.get(key, 0.0)
-        v_grid[i, j] = field_v.get(key, 0.0)
+WIND_CACHE = 'data/wind_grid_cache.npz'
 
-del wind_data, field_u, field_v
-print(f"Wind field: {N_LATS}x{N_LONS}")
+if os.path.exists(WIND_CACHE):
+    cached = np.load(WIND_CACHE)
+    u_grid = cached['u']
+    v_grid = cached['v']
+else:
+    with open('data/wind_data.json') as f:
+        wind_data = json.load(f)
+
+    field_u = {}
+    field_v = {}
+    for p in wind_data:
+        flat = float(int(round(p['lat'] / FIELD_STEP))) * FIELD_STEP
+        flon = float(int(round(p['lon'] / FIELD_STEP))) * FIELD_STEP
+        fkey = (flat, flon)
+        if fkey not in field_u:
+            field_u[fkey] = p['u']
+            field_v[fkey] = p['v']
+
+    u_grid = np.zeros((N_LATS, N_LONS), dtype=np.float32)
+    v_grid = np.zeros((N_LATS, N_LONS), dtype=np.float32)
+    for i, lat in enumerate(range(90, -91, -1)):
+        for j, lon in enumerate(range(-180, 181, 1)):
+            key = (float(lat), float(lon))
+            u_grid[i, j] = field_u.get(key, 0.0)
+            v_grid[i, j] = field_v.get(key, 0.0)
+
+    np.savez(WIND_CACHE, u=u_grid, v=v_grid)
+    del wind_data, field_u, field_v
+
+_t_data = time.perf_counter()
+print(f"BENCHMARK: Data loaded: {(_t_data - _app_start)*1000:.1f}ms")
 
 
 # ============ VECTORIZED PARTICLE SYSTEM ============
@@ -429,41 +436,19 @@ def on_timer(obj, event):
 interactor.AddObserver('TimerEvent', on_timer)
 timer_id = interactor.CreateRepeatingTimer(16)
 
-print(f"\nStarting VTK benchmark: {NUM_PARTICLES} particles, {TRAIL_LENGTH} trail frames")
-print("Pan: left-click drag | Zoom: scroll | Close window for final stats.\n")
-
 interactor.Initialize()
 
-t_first_render = time.perf_counter()
 window.Render()
-first_render_time = time.perf_counter() - t_first_render
-
-print(f"First render: {first_render_time * 1000:.0f}ms")
-
-startup_time = time.perf_counter() - _app_start
+_t_render = time.perf_counter()
 mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
-print(f"\n{'='*50}")
-print(f"BENCHMARK: Startup time: {startup_time:.2f}s")
+print(f"BENCHMARK: First render: {(_t_render - _app_start)*1000:.1f}ms")
 print(f"BENCHMARK: Peak memory: {mem_mb:.1f} MB")
-print(f"{'='*50}\n")
 
 interactor.Start()
 
 # ============ FINAL STATS ============
 elapsed = time.perf_counter() - fps_start
 if total_frames > 0:
-    print(f"\n{'='*50}")
-    print(f"  VTK STANDALONE BENCHMARK RESULTS")
-    print(f"{'='*50}")
-    print(f"  Tile loading:     {tile_load_time:.2f}s ({tiles_loaded} tiles from disk)")
-    print(f"  First render:     {first_render_time * 1000:.0f}ms")
-    print(f"  Time to visible:  {tile_load_time + first_render_time:.2f}s")
-    print(f"{'='*50}")
-    print(f"  Animation FPS:    {total_frames / elapsed:.1f} avg")
-    print(f"  Total frames:     {total_frames}")
-    print(f"  Total time:       {elapsed:.1f}s")
-    print(f"  Avg frame time:   {np.mean(frame_times) * 1000:.1f}ms")
-    print(f"  Min frame time:   {np.min(frame_times) * 1000:.1f}ms")
-    print(f"  Max frame time:   {np.max(frame_times) * 1000:.1f}ms")
-    print(f"  P95 frame time:   {np.percentile(frame_times, 95) * 1000:.1f}ms")
-    print(f"{'='*50}")
+    print(f"\nAnimation FPS: {total_frames / elapsed:.1f} avg | "
+          f"Avg frame: {np.mean(frame_times) * 1000:.1f}ms | "
+          f"P95: {np.percentile(frame_times, 95) * 1000:.1f}ms")
