@@ -167,10 +167,25 @@ async def serve_border_tile(request):
     return web.Response(status=404)
 
 
+async def receive_bench(request):
+    """Receive FPS samples from the browser and print stats matching the C1 format."""
+    data = await request.json()
+    samples = data.get('samples', [])
+    arr = np.array(samples)
+    print(f"\n[BENCH] FPS over {len(arr)} samples ({len(arr)}s of particle animation):")
+    print(f"  samples: {[round(x, 2) for x in samples]}")
+    print(f"  mean = {arr.mean():.2f}")
+    print(f"  std  = {arr.std(ddof=1):.2f}")
+    print(f"  min  = {arr.min():.2f}")
+    print(f"  max  = {arr.max():.2f}")
+    return web.Response(status=204)
+
+
 @server.controller.add("on_server_bind")
 def on_bind(wslink_server):
     wslink_server.app.router.add_get("/tiles/{z}/{x}/{y}.png", serve_tile)
     wslink_server.app.router.add_get("/borders/{z}/{x}/{y}.png", serve_border_tile)
+    wslink_server.app.router.add_post("/bench", receive_bench)
 
 
 # ============ TRAME MODULE: PARTICLE ANIMATION ============

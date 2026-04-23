@@ -28,6 +28,11 @@
   var fpsLastTime = performance.now();
   var interactionEndTime = null;
   var measureRespawn = false;
+  // Benchmark: 30 one-second FPS samples, POSTed to /bench when done.
+  var BENCH_SAMPLES = 30;
+  var fpsSamples = [];
+  var fpsBenchmarkDone = false;
+  var fpsBenchmarkStarted = false;
 
   // === INIT ===
   function init() {
@@ -232,6 +237,14 @@
       h = container.clientHeight;
     ctx.clearRect(0, 0, w, h);
     trailCtx.clearRect(0, 0, w, h);
+    // Reset benchmark state: interaction invalidates prior samples.
+    if (!fpsBenchmarkDone) {
+      if (fpsSamples.length > 0) {
+        console.log("[BENCH] Restart — discarding " + fpsSamples.length + " samples due to interaction.");
+      }
+      fpsSamples = [];
+      fpsBenchmarkStarted = false;
+    }
     animating = true;
     animate();
   }
@@ -313,17 +326,58 @@
     }
     ctx.stroke();
 
-    // FPS measurement
-    fpsFrameCount++;
+    // FPS measurement — 1s windows; collect 30 samples, then POST stats.
     var now = performance.now();
-    if (now - fpsLastTime >= 2000) {
+    if (!fpsBenchmarkStarted) {
+      fpsLastTime = now;
+      fpsFrameCount = 0;
+      fpsBenchmarkStarted = true;
+    }
+    fpsFrameCount++;
+    if (now - fpsLastTime >= 1000) {
       var fps = (fpsFrameCount * 1000) / (now - fpsLastTime);
-      console.log("BENCHMARK: Animation FPS: " + fps.toFixed(1));
+      if (!fpsBenchmarkDone) {
+        fpsSamples.push(fps);
+        console.log(
+          "FPS: " + fps.toFixed(1) +
+          " (sample " + fpsSamples.length + "/" + BENCH_SAMPLES + ")"
+        );
+        if (fpsSamples.length >= BENCH_SAMPLES) {
+          reportBench();
+          fpsBenchmarkDone = true;
+        }
+      }
       fpsFrameCount = 0;
       fpsLastTime = now;
     }
 
     animFrame = requestAnimationFrame(animate);
+  }
+
+  function reportBench() {
+    var arr = fpsSamples.slice();
+    var mean = 0;
+    for (var i = 0; i < arr.length; i++) mean += arr[i];
+    mean /= arr.length;
+    var variance = 0;
+    for (var j = 0; j < arr.length; j++) variance += (arr[j] - mean) * (arr[j] - mean);
+    variance /= (arr.length - 1);
+    var std = Math.sqrt(variance);
+    var mn = Math.min.apply(null, arr);
+    var mx = Math.max.apply(null, arr);
+    console.log("");
+    console.log("[BENCH] FPS over " + arr.length + " samples (" + arr.length + "s of particle animation):");
+    console.log("  mean = " + mean.toFixed(2));
+    console.log("  std  = " + std.toFixed(2));
+    console.log("  min  = " + mn.toFixed(2));
+    console.log("  max  = " + mx.toFixed(2));
+    fetch("/bench", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ samples: arr })
+    }).catch(function (err) {
+      console.error("Failed to POST /bench:", err);
+    });
   }
 
   // === PUBLIC API (controlled via trame ClientStateChange) ===
