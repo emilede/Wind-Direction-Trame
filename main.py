@@ -39,7 +39,7 @@ SPEED_SCALE = 0.6
 MAX_WIND = 35
 TRAIL_LENGTH = 6
 LINE_WIDTH = 3.0
-TARGET_FPS = 20
+TARGET_FPS = 60
 FRAME_INTERVAL = 1.0 / TARGET_FPS
 
 # ============ TRAME SERVER ============
@@ -419,6 +419,11 @@ fps_start = time.perf_counter()
 last_report = fps_start
 animating = True
 
+# Benchmark: 30 one-second FPS samples, printed as [BENCH] block for thesis table.
+BENCH_SAMPLES = 30
+fps_samples = []
+fps_bench_done = False
+
 
 def on_interaction_start(obj=None, event=None):
     """Hide particles and stop animation during pan/zoom."""
@@ -480,10 +485,22 @@ async def animate():
 
             frame_count += 1
             now = time.perf_counter()
-            if now - last_report >= 2.0:
+            if now - last_report >= 1.0:
                 fps = frame_count / (now - last_report)
                 state.fps_text = f"FPS: {fps:.1f}"
-                print(f"FPS: {fps:.1f} | frames: {frame_count}")
+                global fps_bench_done
+                if not fps_bench_done:
+                    fps_samples.append(fps)
+                    print(f"FPS: {fps:.1f} (sample {len(fps_samples)}/{BENCH_SAMPLES})")
+                    if len(fps_samples) >= BENCH_SAMPLES:
+                        arr = np.array(fps_samples)
+                        print(f"\n[BENCH] FPS over {len(arr)} samples ({len(arr)}s of particle animation, server-side VTK render + stream):")
+                        print(f"  samples: {[round(x, 2) for x in fps_samples]}")
+                        print(f"  mean = {arr.mean():.2f}")
+                        print(f"  std  = {arr.std(ddof=1):.2f}")
+                        print(f"  min  = {arr.min():.2f}")
+                        print(f"  max  = {arr.max():.2f}")
+                        fps_bench_done = True
                 frame_count = 0
                 last_report = now
 
