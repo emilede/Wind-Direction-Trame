@@ -42,6 +42,16 @@ LINE_WIDTH = 3.0
 TARGET_FPS = 60
 FRAME_INTERVAL = 1.0 / TARGET_FPS
 
+# ============ VIEW MATCH (paste from trame-native-particles [FINAL] output) ============
+VIEW_LAT = 37.4749
+VIEW_LON = -55.2393
+VIEW_ZOOM = 5
+# Manual overrides — set to a number to bypass the lat/lon/zoom conversion.
+# Useful when interaction is wedged and you want to tune by editing+restarting.
+CAMERA_FOCAL_X = None        # pixel x in 3x-wide composite (None = compute from VIEW_LON)
+CAMERA_FOCAL_Y = None        # pixel y, bottom-origin (None = compute from VIEW_LAT)
+CAMERA_PARALLEL_SCALE = None  # half visible vertical extent in pixels (None = compute from VIEW_ZOOM)
+
 # ============ TRAME SERVER ============
 
 server = get_server(client_type="vue3")
@@ -327,6 +337,33 @@ cam.SetPosition(WRAP_W / 2, IMG_H / 2, 1000)
 cam.SetFocalPoint(WRAP_W / 2, IMG_H / 2, 0)
 cam.SetParallelScale(IMG_H / 2)
 INITIAL_PARALLEL_SCALE = IMG_H / 2
+
+
+def _latlon_zoom_to_camera(lat, lon, zoom):
+    """Leaflet (lat, lon, zoom) → (focal_x, focal_y, parallel_scale) in VTK pixel space.
+    The composite is 3x-wide for horizontal wrapping, so focal_x is offset into the middle copy."""
+    lat_rad = np.deg2rad(lat)
+    tx = (lon + 180.0) / 360.0 * NUM_TILES
+    ty_top = NUM_TILES * (1 - np.arcsinh(np.tan(lat_rad)) / np.pi) / 2
+    px = tx * TILE_SIZE
+    py = (NUM_TILES - ty_top) * TILE_SIZE  # VTK y is bottom-origin
+    focal_x = px + IMG_W  # middle copy of the 3x-wide composite
+    focal_y = py
+    parallel_scale = INITIAL_PARALLEL_SCALE / (2 ** (zoom - ZOOM))
+    return float(focal_x), float(focal_y), float(parallel_scale)
+
+
+_fx, _fy, _ps = _latlon_zoom_to_camera(VIEW_LAT, VIEW_LON, VIEW_ZOOM)
+if CAMERA_FOCAL_X is not None:
+    _fx = float(CAMERA_FOCAL_X)
+if CAMERA_FOCAL_Y is not None:
+    _fy = float(CAMERA_FOCAL_Y)
+if CAMERA_PARALLEL_SCALE is not None:
+    _ps = float(CAMERA_PARALLEL_SCALE)
+cam.SetFocalPoint(_fx, _fy, 0)
+cam.SetPosition(_fx, _fy, 1000)
+cam.SetParallelScale(_ps)
+print(f"VIEW_MATCH: focal=({_fx:.1f}, {_fy:.1f}) parallel_scale={_ps:.1f}")
 
 # Render window
 render_window = vtk.vtkRenderWindow()
