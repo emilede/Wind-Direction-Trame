@@ -576,10 +576,10 @@ with SinglePageLayout(server) as layout:
             )
             ctrl.view_update = view.update
 
-        # FPS overlay
+        # FPS overlay (hidden for screenshots — remove `display:none;` to restore)
         html_widgets.Div(
             v_text=("fps_text",),
-            style="position:fixed; top:10px; right:10px; color:white; "
+            style="display:none; position:fixed; top:10px; right:10px; color:white; "
                   "font-size:14px; font-weight:600; z-index:10000; "
                   "background:rgba(0,0,0,0.5); padding:4px 10px; border-radius:8px; "
                   "font-family:monospace;",
