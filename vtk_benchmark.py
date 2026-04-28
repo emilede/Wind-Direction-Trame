@@ -7,6 +7,7 @@ Prints FPS metrics for comparison with the trame version.
 """
 
 import os
+import sys
 import json
 import time
 import resource
@@ -380,6 +381,11 @@ fps_start = time.perf_counter()
 last_report = fps_start
 frame_times = []
 
+# Benchmark: 30 one-second FPS samples, then print stats block and exit.
+BENCH_SAMPLES = 30
+fps_samples = []
+fps_bench_done = False
+
 # Set initial bounds
 bounds = get_camera_bounds()
 particles.set_bounds(bounds)
@@ -425,10 +431,22 @@ def on_timer(obj, event):
     total_frames += 1
 
     now = time.perf_counter()
-    if now - last_report >= 2.0:
+    if now - last_report >= 1.0:
         fps = frame_count / (now - last_report)
-        avg_ms = np.mean(frame_times[-frame_count:]) * 1000
-        print(f"FPS: {fps:.1f} | avg frame: {avg_ms:.1f}ms | total frames: {total_frames}")
+        global fps_bench_done
+        if not fps_bench_done:
+            fps_samples.append(fps)
+            print(f"FPS: {fps:.1f} (sample {len(fps_samples)}/{BENCH_SAMPLES})")
+            if len(fps_samples) >= BENCH_SAMPLES:
+                arr = np.array(fps_samples)
+                print(f"\n[BENCH] FPS over {len(arr)} samples ({len(arr)}s of particle animation, native VTK desktop):")
+                print(f"  samples: {[round(x, 2) for x in fps_samples]}")
+                print(f"  mean = {arr.mean():.2f}")
+                print(f"  std  = {arr.std(ddof=1):.2f}")
+                print(f"  min  = {arr.min():.2f}")
+                print(f"  max  = {arr.max():.2f}")
+                fps_bench_done = True
+                sys.exit(0)
         frame_count = 0
         last_report = now
 
