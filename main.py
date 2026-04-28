@@ -11,6 +11,7 @@ import os
 import json
 import time
 import math
+import atexit
 import resource
 import numpy as np
 from aiohttp import web
@@ -119,6 +120,31 @@ state.mouse_data = None
 # Particle control state (reactive via ClientStateChange)
 state.particle_active = True
 state.particle_count = 1500
+
+# Map view state (Leaflet) — initial values match the LMap bindings below.
+# These update automatically as the user pans/zooms; we print them so the
+# trame-vtk-particles and vtk-standalone branches can be matched to the same view.
+state.zoom = 3
+state.center = [20, 0]
+
+
+def print_view(label="VIEW"):
+    print(f"\n[{label}]")
+    print(f"  zoom   = {state.zoom}")
+    print(f"  center = {state.center}  # [lat, lon]")
+
+
+@state.change("zoom", "center")
+def _on_view_change(**kwargs):
+    print_view("LIVE")
+
+
+@atexit.register
+def _print_final_view():
+    print("\n[FINAL — copy these values to match the trame-vtk-particles and vtk branches]")
+    print(f"# Leaflet view:")
+    print(f"zoom   = {state.zoom}")
+    print(f"center = {state.center}  # [lat, lon]")
 
 
 @state.change("mouse_data")
@@ -282,6 +308,8 @@ with SinglePageLayout(server) as layout:
                 max_zoom=5,
                 min_zoom=3,
                 style="height: 100%; width: 100%;",
+                update_zoom="zoom = $event",
+                update_center="center = $event",
             ):
                 leaflet.LTileLayer(
                     url=("wind_url", f"/tiles/{{z}}/{{x}}/{{y}}.png?v={CACHE_BUST}"),
